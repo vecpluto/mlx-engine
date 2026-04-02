@@ -5,12 +5,12 @@ use std::time::Instant;
 
 use anyhow::Result;
 use mlx_lm::cache::ConcatKeyValueCache;
-use mlx_lm::models::qwen3::{Model, ModelInput, sample};
-use mlx_rs::module::Module;
-use mlx_rs::ops::indexing::{IndexOp, NewAxis};
+use mlx_lm::models::qwen3::sample;
 use mlx_rs::transforms::eval;
 use mlx_rs::Array;
 use tokenizers::Tokenizer;
+
+use crate::model::ModelWrapper;
 
 // ── Public output type ─────────────────────────────────────────────────────────
 
@@ -32,26 +32,13 @@ pub struct GenerateOutput {
 
 /// Single-step forward pass returning shape `(batch, vocab_size)` logits for the last token.
 ///
-/// The library's `Generate` iterator has a decode-mode shape bug: `argmax_axis` on
-/// `(batch, 1, vocab_size)` produces `(batch, 1)`, causing the next input to be
-/// `(batch, 1, 1)` and growing unboundedly.  We implement our own loop to avoid this.
+/// Delegates to [`ModelWrapper::forward_step`] which handles the shape slicing.
 pub fn forward_step(
-    model: &mut Model,
+    model: &mut ModelWrapper,
     inputs: &Array,
     cache: &mut Vec<Option<ConcatKeyValueCache>>,
 ) -> Result<Array> {
-    let input = ModelInput {
-        inputs,
-        mask: None,
-        cache,
-    };
-    let logits = model
-        .forward(input)
-        .map_err(|e| anyhow::anyhow!("{:?}", e))?;
-
-    // logits shape: (batch, seq_len, vocab_size) — select last position.
-    let last_logits = logits.index((.., -1i32, ..));
-    Ok(last_logits)
+    model.forward_step(inputs, cache)
 }
 
 // ── Unified generation ─────────────────────────────────────────────────────────
@@ -77,7 +64,7 @@ pub fn forward_step(
 /// let out = generate(&mut model, &tokenizer, &prompt, temp, max_tokens, &eos_tokens, |_| {})?;
 /// ```
 pub fn generate(
-    model: &mut Model,
+    model: &mut ModelWrapper,
     tokenizer: &Tokenizer,
     prompt: &str,
     temp: f32,
@@ -85,12 +72,14 @@ pub fn generate(
     eos_tokens: &[u32],
     mut on_chunk: impl FnMut(&str),
 ) -> Result<GenerateOutput> {
+    use mlx_rs::ops::indexing::{IndexOp, NewAxis};
+
     let encoding = tokenizer
         .encode(prompt, true)
         .map_err(|e| anyhow::anyhow!("{}", e))?;
     let num_prompt_tokens = encoding.get_ids().len();
 
-    let num_layers = model.args.num_hidden_layers as usize;
+    let num_layers = model.num_hidden_layers();
     let mut cache: Vec<Option<ConcatKeyValueCache>> =
         (0..num_layers).map(|_| Some(ConcatKeyValueCache::new())).collect();
 
@@ -203,7 +192,7 @@ pub fn print_perf_stats(out: &GenerateOutput) {
 ///
 /// Wraps [`generate`] with an `on_chunk` that writes to stdout and flushes.
 pub fn generate_streaming(
-    model: &mut Model,
+    model: &mut ModelWrapper,
     tokenizer: &Tokenizer,
     prompt: &str,
     temp: f32,

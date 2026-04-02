@@ -2,7 +2,7 @@
 
 use anyhow::Result;
 use mlx_lm::cache::ConcatKeyValueCache;
-use mlx_lm::models::qwen3::{Model, sample};
+use mlx_lm::models::qwen3::sample;
 use mlx_rs::ops::indexing::{IndexOp, NewAxis};
 use mlx_rs::transforms::eval;
 use mlx_rs::Array;
@@ -10,10 +10,11 @@ use std::time::Instant;
 use tokenizers::Tokenizer;
 
 use crate::inference::forward_step;
+use crate::model::ModelWrapper;
 
 /// Run a benchmark and print a formatted results table.
 pub fn run_bench(
-    model: &mut Model,
+    model: &mut ModelWrapper,
     tokenizer: &Tokenizer,
     prompt: &str,
     num_tokens: usize,
@@ -29,7 +30,7 @@ pub fn run_bench(
     let prompt_array = Array::from(encoding.get_ids()).index(NewAxis);
     let num_prompt_tokens = encoding.get_ids().len();
 
-    let num_layers = model.args.num_hidden_layers as usize;
+    let num_layers = model.num_hidden_layers();
     let mut cache: Vec<Option<ConcatKeyValueCache>> =
         (0..num_layers).map(|_| Some(ConcatKeyValueCache::new())).collect();
 

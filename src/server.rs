@@ -1,19 +1,19 @@
-//! OpenAI-compatible HTTP API server.
+//! OpenAI-compatible HTTP API server with true per-token SSE streaming.
 //!
 //! mlx-rs `Array` / `Model` are `!Send` (they rely on thread-local MLX stream state).
 //! We cannot pass them across thread boundaries.
 //!
 //! Architecture:
-//!   - One dedicated OS thread owns `Model` + `Tokenizer` for its entire lifetime.
+//!   - One dedicated OS thread owns `ModelWrapper` + `Tokenizer` for its entire lifetime.
 //!   - Axum handlers communicate with that thread via a `std::sync::mpsc` channel.
-//!   - Each request packages its parameters into an `InferRequest` and attaches a
-//!     one-shot reply channel; the inference thread sends back `InferResponse`.
-//!   - The Axum handler blocks its `spawn_blocking` worker while waiting for the reply.
+//!   - For streaming requests, a `tokio::sync::mpsc` channel carries `StreamEvent` tokens
+//!     from the inference thread back to the async Axum handler as they are produced.
+//!   - For non-streaming requests, the inference thread sends back a complete `InferResponse`.
 //!   - A `Mutex<Sender<InferRequest>>` in shared state serialises concurrent requests.
 
 use std::sync::{Arc, Mutex};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use axum::{
     Json,
     extract::State,
@@ -22,13 +22,30 @@ use axum::{
     routing::post,
     Router,
 };
-use mlx_lm::models::qwen3::Model;
 use serde::{Deserialize, Serialize};
 use tokenizers::Tokenizer;
 use tower_http::cors::{Any, CorsLayer};
 use uuid::Uuid;
 
 use crate::inference::generate;
+use crate::model::{ModelFamily, ModelWrapper};
+
+// ── Stream event ───────────────────────────────────────────────────────────────
+
+/// Events sent from the inference thread to the async handler during streaming.
+pub enum StreamEvent {
+    /// A decoded text chunk (may be multiple tokens when flushed in batches).
+    Token(String),
+    /// Generation complete.
+    Done {
+        #[allow(dead_code)]
+        prompt_tokens: usize,
+        #[allow(dead_code)]
+        completion_tokens: usize,
+    },
+    /// An error occurred.
+    Error(String),
+}
 
 // ── Internal channel types ─────────────────────────────────────────────────────
 
@@ -37,10 +54,13 @@ struct InferRequest {
     prompt: String,
     temp: f32,
     max_tokens: usize,
-    reply: std::sync::mpsc::SyncSender<InferResponse>,
+    /// For streaming: a sender for per-token events. `None` for non-streaming.
+    stream_tx: Option<tokio::sync::mpsc::UnboundedSender<StreamEvent>>,
+    /// For non-streaming: a one-shot reply channel.
+    reply: Option<std::sync::mpsc::SyncSender<InferResponse>>,
 }
 
-/// Result of a single inference job.
+/// Result of a single non-streaming inference job.
 struct InferResponse {
     text: Result<GeneratedText>,
 }
@@ -51,11 +71,12 @@ struct GeneratedText {
     completion_tokens: usize,
 }
 
-/// Axum shared state: a mutex-protected sender to the inference thread.
+/// Axum shared state: a mutex-protected sender to the inference thread, plus model metadata.
 #[derive(Clone)]
 pub struct AppState {
     tx: Arc<Mutex<std::sync::mpsc::SyncSender<InferRequest>>>,
     model_name: Arc<String>,
+    model_family: ModelFamily,
 }
 
 // ── OpenAI-compatible request/response types ───────────────────────────────────
@@ -141,9 +162,9 @@ pub struct ChunkDelta {
     pub content: Option<String>,
 }
 
-// ── Chat template ──────────────────────────────────────────────────────────────
+// ── Chat templates ─────────────────────────────────────────────────────────────
 
-/// Format a list of chat messages into Qwen3's instruct prompt format.
+/// Format messages using Qwen3's ChatML instruct format.
 ///
 /// ```text
 /// <|im_start|>system
@@ -159,6 +180,36 @@ pub fn format_qwen3_prompt(messages: &[ChatMessage]) -> String {
     }
     prompt.push_str("<|im_start|>assistant\n");
     prompt
+}
+
+/// Format messages using Llama 3's instruct format.
+///
+/// ```text
+/// <|begin_of_text|><|start_header_id|>system<|end_header_id|>
+///
+/// You are a helpful assistant.<|eot_id|><|start_header_id|>user<|end_header_id|>
+///
+/// Hello<|eot_id|><|start_header_id|>assistant<|end_header_id|>
+///
+/// ```
+pub fn format_llama3_prompt(messages: &[ChatMessage]) -> String {
+    let mut prompt = String::from("<|begin_of_text|>");
+    for msg in messages {
+        prompt.push_str(&format!(
+            "<|start_header_id|>{}<|end_header_id|>\n\n{}<|eot_id|>",
+            msg.role, msg.content
+        ));
+    }
+    prompt.push_str("<|start_header_id|>assistant<|end_header_id|>\n\n");
+    prompt
+}
+
+/// Format messages according to the detected model family.
+pub fn format_prompt(messages: &[ChatMessage], family: ModelFamily) -> String {
+    match family {
+        ModelFamily::Qwen3 => format_qwen3_prompt(messages),
+        ModelFamily::Llama => format_llama3_prompt(messages),
+    }
 }
 
 // ── Axum error type ────────────────────────────────────────────────────────────
@@ -189,7 +240,7 @@ async fn chat_completions(
     State(state): State<AppState>,
     Json(req): Json<ChatCompletionRequest>,
 ) -> Result<Response, ApiError> {
-    let prompt = format_qwen3_prompt(&req.messages);
+    let prompt = format_prompt(&req.messages, state.model_family);
     let temp = req.temperature;
     let max_tokens = req.max_tokens;
     let model_name = (*state.model_name).clone();
@@ -198,9 +249,120 @@ async fn chat_completions(
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
+    let is_stream = req.stream;
 
     let tx = Arc::clone(&state.tx);
 
+    if is_stream {
+        // True per-token SSE streaming.
+        let (stream_tx, mut stream_rx) =
+            tokio::sync::mpsc::unbounded_channel::<StreamEvent>();
+
+        // Send the inference request with streaming channel.
+        {
+            let sender = tx.lock().map_err(|_| anyhow::anyhow!("inference thread is gone"))?;
+            sender
+                .send(InferRequest {
+                    prompt,
+                    temp,
+                    max_tokens,
+                    stream_tx: Some(stream_tx),
+                    reply: None,
+                })
+                .map_err(|_| anyhow::anyhow!("inference thread channel closed"))?;
+        }
+
+        // Build an SSE body by bridging the tokio receiver into a stream.
+        use axum::body::Body;
+        use axum::http::header;
+        use futures_util::stream::StreamExt;
+
+        let id = request_id.clone();
+        let model_name_clone = model_name.clone();
+
+        let sse_stream = async_stream::stream! {
+            // First chunk: role header
+            let role_chunk = ChatCompletionChunk {
+                id: id.clone(),
+                object: "chat.completion.chunk",
+                created,
+                model: model_name_clone.clone(),
+                choices: vec![ChunkChoice {
+                    index: 0,
+                    delta: ChunkDelta { role: Some("assistant"), content: None },
+                    finish_reason: None,
+                }],
+            };
+            if let Ok(json) = serde_json::to_string(&role_chunk) {
+                yield Ok::<_, std::convert::Infallible>(
+                    format!("data: {json}\n\n").into_bytes()
+                );
+            }
+
+            loop {
+                match stream_rx.recv().await {
+                    Some(StreamEvent::Token(text)) => {
+                        let chunk = ChatCompletionChunk {
+                            id: id.clone(),
+                            object: "chat.completion.chunk",
+                            created,
+                            model: model_name_clone.clone(),
+                            choices: vec![ChunkChoice {
+                                index: 0,
+                                delta: ChunkDelta { role: None, content: Some(text) },
+                                finish_reason: None,
+                            }],
+                        };
+                        if let Ok(json) = serde_json::to_string(&chunk) {
+                            yield Ok::<_, std::convert::Infallible>(
+                                format!("data: {json}\n\n").into_bytes()
+                            );
+                        }
+                    }
+                    Some(StreamEvent::Done { .. }) | None => {
+                        let done_chunk = ChatCompletionChunk {
+                            id: id.clone(),
+                            object: "chat.completion.chunk",
+                            created,
+                            model: model_name_clone.clone(),
+                            choices: vec![ChunkChoice {
+                                index: 0,
+                                delta: ChunkDelta { role: None, content: None },
+                                finish_reason: Some("stop"),
+                            }],
+                        };
+                        if let Ok(json) = serde_json::to_string(&done_chunk) {
+                            yield Ok::<_, std::convert::Infallible>(
+                                format!("data: {json}\n\ndata: [DONE]\n\n").into_bytes()
+                            );
+                        }
+                        break;
+                    }
+                    Some(StreamEvent::Error(msg)) => {
+                        let err = serde_json::json!({ "error": { "message": msg } });
+                        yield Ok::<_, std::convert::Infallible>(
+                            format!("data: {}\n\n", err).into_bytes()
+                        );
+                        break;
+                    }
+                }
+            }
+        };
+
+        let body = Body::from_stream(sse_stream.map(|r: Result<Vec<u8>, std::convert::Infallible>| r));
+
+        let response = axum::response::Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, "text/event-stream")
+            .header(header::CACHE_CONTROL, "no-cache")
+            .header("X-Accel-Buffering", "no")
+            .body(body)
+            .map_err(|e| anyhow::anyhow!("failed to build SSE response: {e}"))?;
+
+        return Ok(response);
+    }
+
+    // Non-streaming: block until complete response is ready.
     let gen = tokio::task::spawn_blocking(move || {
         let (reply_tx, reply_rx) = std::sync::mpsc::sync_channel::<InferResponse>(1);
 
@@ -208,7 +370,8 @@ async fn chat_completions(
             prompt,
             temp,
             max_tokens,
-            reply: reply_tx,
+            stream_tx: None,
+            reply: Some(reply_tx),
         };
 
         {
@@ -227,54 +390,6 @@ async fn chat_completions(
 
     let gt = gen.text?;
 
-    if req.stream {
-        use axum::body::Body;
-        use axum::http::header;
-
-        let id = request_id.clone();
-        let chunk = ChatCompletionChunk {
-            id: id.clone(),
-            object: "chat.completion.chunk",
-            created,
-            model: model_name.clone(),
-            choices: vec![ChunkChoice {
-                index: 0,
-                delta: ChunkDelta {
-                    role: Some("assistant"),
-                    content: Some(gt.content.clone()),
-                },
-                finish_reason: None,
-            }],
-        };
-        let done_chunk = ChatCompletionChunk {
-            id,
-            object: "chat.completion.chunk",
-            created,
-            model: model_name,
-            choices: vec![ChunkChoice {
-                index: 0,
-                delta: ChunkDelta { role: None, content: None },
-                finish_reason: Some("stop"),
-            }],
-        };
-
-        let sse_body = format!(
-            "data: {}\n\ndata: {}\n\ndata: [DONE]\n\n",
-            serde_json::to_string(&chunk)?,
-            serde_json::to_string(&done_chunk)?
-        );
-
-        let response = axum::response::Response::builder()
-            .status(StatusCode::OK)
-            .header(header::CONTENT_TYPE, "text/event-stream")
-            .header(header::CACHE_CONTROL, "no-cache")
-            .header("X-Accel-Buffering", "no")
-            .body(Body::from(sse_body))
-            .map_err(|e| anyhow::anyhow!("failed to build SSE response: {e}"))?;
-
-        return Ok(response);
-    }
-
     let response = ChatCompletionResponse {
         id: request_id,
         object: "chat.completion",
@@ -282,10 +397,7 @@ async fn chat_completions(
         model: model_name,
         choices: vec![ChatChoice {
             index: 0,
-            message: AssistantMessage {
-                role: "assistant",
-                content: gt.content,
-            },
+            message: AssistantMessage { role: "assistant", content: gt.content },
             finish_reason: "stop",
         }],
         usage: UsageInfo {
@@ -304,7 +416,7 @@ async fn chat_completions(
 ///
 /// Blocks until the channel sender side is dropped (server shutdown).
 fn inference_loop(
-    mut model: Model,
+    mut model: ModelWrapper,
     tokenizer: Tokenizer,
     eos_tokens: Vec<u32>,
     rx: std::sync::mpsc::Receiver<InferRequest>,
@@ -312,27 +424,69 @@ fn inference_loop(
     eprintln!("[serve] inference thread ready");
 
     for req in rx {
-        let InferRequest { prompt, temp, max_tokens, reply } = req;
+        let InferRequest { prompt, temp, max_tokens, stream_tx, reply } = req;
 
-        let prompt_token_count = tokenizer
-            .encode(prompt.as_str(), true)
-            .map(|e| e.get_ids().len())
-            .unwrap_or(0);
+        if let Some(tx) = stream_tx {
+            // Streaming mode: send tokens as they are decoded.
+            let prompt_token_count = tokenizer
+                .encode(prompt.as_str(), true)
+                .map(|e| e.get_ids().len())
+                .unwrap_or(0);
 
-        let result = generate(&mut model, &tokenizer, &prompt, temp, max_tokens, &eos_tokens, |_| {});
+            let result = generate(
+                &mut model,
+                &tokenizer,
+                &prompt,
+                temp,
+                max_tokens,
+                &eos_tokens,
+                |chunk| {
+                    // Ignore send errors (client may have disconnected).
+                    let _ = tx.send(StreamEvent::Token(chunk.to_owned()));
+                },
+            );
 
-        let response = match result {
-            Ok(out) => InferResponse {
-                text: Ok(GeneratedText {
-                    content: out.text,
-                    prompt_tokens: prompt_token_count,
-                    completion_tokens: out.completion_tokens,
-                }),
-            },
-            Err(e) => InferResponse { text: Err(e) },
-        };
+            match result {
+                Ok(out) => {
+                    let _ = tx.send(StreamEvent::Done {
+                        prompt_tokens: prompt_token_count,
+                        completion_tokens: out.completion_tokens,
+                    });
+                }
+                Err(e) => {
+                    let _ = tx.send(StreamEvent::Error(e.to_string()));
+                }
+            }
+        } else if let Some(reply_tx) = reply {
+            // Non-streaming mode: collect and send full response.
+            let prompt_token_count = tokenizer
+                .encode(prompt.as_str(), true)
+                .map(|e| e.get_ids().len())
+                .unwrap_or(0);
 
-        let _ = reply.send(response);
+            let result = generate(
+                &mut model,
+                &tokenizer,
+                &prompt,
+                temp,
+                max_tokens,
+                &eos_tokens,
+                |_| {},
+            );
+
+            let response = match result {
+                Ok(out) => InferResponse {
+                    text: Ok(GeneratedText {
+                        content: out.text,
+                        prompt_tokens: prompt_token_count,
+                        completion_tokens: out.completion_tokens,
+                    }),
+                },
+                Err(e) => InferResponse { text: Err(e) },
+            };
+
+            let _ = reply_tx.send(response);
+        }
     }
 
     eprintln!("[serve] inference channel closed, thread exiting");
@@ -342,12 +496,13 @@ fn inference_loop(
 
 /// Start the HTTP server.  Must be called inside a Tokio runtime.
 pub async fn run_serve(
-    model: Model,
+    model: ModelWrapper,
     tokenizer: Tokenizer,
     eos_tokens: Vec<u32>,
     model_name: String,
     host: &str,
     port: u16,
+    model_family: ModelFamily,
 ) -> Result<()> {
     let (tx, rx) = std::sync::mpsc::sync_channel::<InferRequest>(4);
 
@@ -359,6 +514,7 @@ pub async fn run_serve(
     let state = AppState {
         tx: Arc::new(Mutex::new(tx)),
         model_name: Arc::new(model_name),
+        model_family,
     };
 
     let cors = CorsLayer::new()
@@ -389,40 +545,29 @@ pub async fn run_serve(
     Ok(())
 }
 
-// ── Needed for module imports ──────────────────────────────────────────────────
-
-use anyhow::Context;
-
 // ── Tests ──────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    // ── Qwen3 prompt formatting ────────────────────────────────────────────────
+
     #[test]
-    fn test_format_single_user_message() {
-        let messages = vec![ChatMessage {
-            role: "user".into(),
-            content: "Hello".into(),
-        }];
+    fn test_format_qwen3_single_user_message() {
+        let messages = vec![ChatMessage { role: "user".into(), content: "Hello".into() }];
         let prompt = format_qwen3_prompt(&messages);
-        assert_eq!(
-            prompt,
-            "<|im_start|>user\nHello<|im_end|>\n<|im_start|>assistant\n"
-        );
+        assert_eq!(prompt, "<|im_start|>user\nHello<|im_end|>\n<|im_start|>assistant\n");
     }
 
     #[test]
-    fn test_format_system_plus_user() {
+    fn test_format_qwen3_system_plus_user() {
         let messages = vec![
             ChatMessage {
                 role: "system".into(),
                 content: "You are a helpful assistant.".into(),
             },
-            ChatMessage {
-                role: "user".into(),
-                content: "What is 2+2?".into(),
-            },
+            ChatMessage { role: "user".into(), content: "What is 2+2?".into() },
         ];
         let prompt = format_qwen3_prompt(&messages);
         assert!(
@@ -433,7 +578,7 @@ mod tests {
     }
 
     #[test]
-    fn test_format_multi_turn() {
+    fn test_format_qwen3_multi_turn() {
         let messages = vec![
             ChatMessage { role: "user".into(), content: "Hi".into() },
             ChatMessage { role: "assistant".into(), content: "Hello!".into() },
@@ -449,14 +594,14 @@ mod tests {
     }
 
     #[test]
-    fn test_format_empty_messages() {
+    fn test_format_qwen3_empty_messages() {
         let messages: Vec<ChatMessage> = vec![];
         let prompt = format_qwen3_prompt(&messages);
         assert_eq!(prompt, "<|im_start|>assistant\n");
     }
 
     #[test]
-    fn test_format_special_characters() {
+    fn test_format_qwen3_special_characters() {
         let messages = vec![ChatMessage {
             role: "user".into(),
             content: "What's 5 * 7?\n(show work)".into(),
@@ -464,6 +609,58 @@ mod tests {
         let prompt = format_qwen3_prompt(&messages);
         assert!(prompt.contains("What's 5 * 7?\n(show work)"));
     }
+
+    // ── Llama3 prompt formatting ───────────────────────────────────────────────
+
+    #[test]
+    fn test_format_llama3_single_user_message() {
+        let messages = vec![ChatMessage { role: "user".into(), content: "Hello".into() }];
+        let prompt = format_llama3_prompt(&messages);
+        assert!(prompt.starts_with("<|begin_of_text|>"));
+        assert!(prompt.contains("<|start_header_id|>user<|end_header_id|>\n\nHello<|eot_id|>"));
+        assert!(prompt.ends_with(
+            "<|start_header_id|>assistant<|end_header_id|>\n\n"
+        ));
+    }
+
+    #[test]
+    fn test_format_llama3_system_plus_user() {
+        let messages = vec![
+            ChatMessage {
+                role: "system".into(),
+                content: "You are a helpful assistant.".into(),
+            },
+            ChatMessage { role: "user".into(), content: "Hi".into() },
+        ];
+        let prompt = format_llama3_prompt(&messages);
+        assert!(prompt.starts_with("<|begin_of_text|>"));
+        assert!(prompt.contains(
+            "<|start_header_id|>system<|end_header_id|>\n\nYou are a helpful assistant.<|eot_id|>"
+        ));
+        assert!(prompt.contains("<|start_header_id|>user<|end_header_id|>\n\nHi<|eot_id|>"));
+        assert!(prompt.ends_with("<|start_header_id|>assistant<|end_header_id|>\n\n"));
+    }
+
+    #[test]
+    fn test_format_llama3_empty_messages() {
+        let messages: Vec<ChatMessage> = vec![];
+        let prompt = format_llama3_prompt(&messages);
+        assert_eq!(
+            prompt,
+            "<|begin_of_text|><|start_header_id|>assistant<|end_header_id|>\n\n"
+        );
+    }
+
+    #[test]
+    fn test_format_prompt_dispatch() {
+        let messages = vec![ChatMessage { role: "user".into(), content: "Hi".into() }];
+        let qwen3 = format_prompt(&messages, ModelFamily::Qwen3);
+        let llama = format_prompt(&messages, ModelFamily::Llama);
+        assert!(qwen3.contains("<|im_start|>"));
+        assert!(llama.contains("<|begin_of_text|>"));
+    }
+
+    // ── Request/response serialization ────────────────────────────────────────
 
     #[test]
     fn test_request_defaults() {
@@ -502,10 +699,7 @@ mod tests {
             model: "qwen3-4b".into(),
             choices: vec![ChatChoice {
                 index: 0,
-                message: AssistantMessage {
-                    role: "assistant",
-                    content: "4".into(),
-                },
+                message: AssistantMessage { role: "assistant", content: "4".into() },
                 finish_reason: "stop",
             }],
             usage: UsageInfo {
@@ -524,11 +718,8 @@ mod tests {
 
     #[test]
     fn test_usage_total() {
-        let usage = UsageInfo {
-            prompt_tokens: 42,
-            completion_tokens: 13,
-            total_tokens: 42 + 13,
-        };
+        let usage =
+            UsageInfo { prompt_tokens: 42, completion_tokens: 13, total_tokens: 42 + 13 };
         assert_eq!(usage.total_tokens, 55);
     }
 
@@ -543,10 +734,7 @@ mod tests {
 
     #[test]
     fn test_chunk_delta_includes_some_fields() {
-        let delta = ChunkDelta {
-            role: Some("assistant"),
-            content: Some("hello".into()),
-        };
+        let delta = ChunkDelta { role: Some("assistant"), content: Some("hello".into()) };
         let json = serde_json::to_string(&delta).unwrap();
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(v["role"], "assistant");

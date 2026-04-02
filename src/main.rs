@@ -151,8 +151,13 @@ fn main() -> Result<()> {
         Commands::Bench { model, prompt, num_tokens } => run_bench_cmd(&model, &prompt, num_tokens),
         Commands::Serve { model, host, port } => {
             let (mdl, tokenizer, eos_tokens, _path) = load_model_and_tokenizer(&model)?;
+            // Determine model family for prompt formatting in the server.
+            let family = match &mdl {
+                model::ModelWrapper::Qwen3(_) => model::ModelFamily::Qwen3,
+                model::ModelWrapper::Llama(_) => model::ModelFamily::Llama,
+            };
             tokio::runtime::Runtime::new()?.block_on(async {
-                server::run_serve(mdl, tokenizer, eos_tokens, model, &host, port).await
+                server::run_serve(mdl, tokenizer, eos_tokens, model, &host, port, family).await
             })
         }
     }

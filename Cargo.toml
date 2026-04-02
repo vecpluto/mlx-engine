@@ -9,10 +9,10 @@ keywords = ["llm", "mlx", "apple-silicon", "inference", "rust"]
 categories = ["command-line-utilities", "science"]
 
 [dependencies]
-mlx-rs = { git = "https://github.com/oxiglade/mlx-rs.git", tag = "v0.25.3" }
-mlx-lm = { git = "https://github.com/oxiglade/mlx-rs.git", tag = "v0.25.3" }
-mlx-lm-utils = { git = "https://github.com/oxiglade/mlx-rs.git", tag = "v0.25.3" }
-mlx-macros = { git = "https://github.com/oxiglade/mlx-rs.git", tag = "v0.25.3" }
+mlx-rs = { git = "https://github.com/oxiglade/mlx-rs.git", rev = "f4aa309c79b6be35255ca7d34157dfc10d9ed4c9" }
+mlx-lm = { git = "https://github.com/oxiglade/mlx-rs.git", rev = "f4aa309c79b6be35255ca7d34157dfc10d9ed4c9" }
+mlx-lm-utils = { git = "https://github.com/oxiglade/mlx-rs.git", rev = "f4aa309c79b6be35255ca7d34157dfc10d9ed4c9" }
+mlx-macros = { git = "https://github.com/oxiglade/mlx-rs.git", rev = "f4aa309c79b6be35255ca7d34157dfc10d9ed4c9" }
 
 clap = { version = "4", features = ["derive"] }
 tokenizers = { version = "0.22", features = ["http"] }
@@ -27,6 +27,8 @@ axum = { version = "0.7", features = ["macros"] }
 tokio = { version = "1", features = ["full"] }
 tower-http = { version = "0.5", features = ["cors"] }
 uuid = { version = "1", features = ["v4"] }
+futures-util = "0.3"
+async-stream = "0.3"
 
 [profile.release]
 lto = true
