@@ -76,10 +76,15 @@ cargo build --release
   --model mlx-community/Qwen3-4B-4bit \
   --port 8080
 
-# Then use any OpenAI SDK:
+# Non-streaming request
 curl http://localhost:8080/v1/chat/completions \
   -H 'Content-Type: application/json' \
   -d '{"model":"qwen3","messages":[{"role":"user","content":"Hello!"}],"max_tokens":100}'
+
+# Streaming request (per-token SSE)
+curl --no-buffer http://localhost:8080/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"qwen3","messages":[{"role":"user","content":"Hello!"}],"max_tokens":100,"stream":true}'
 ```
 
 Models are automatically resolved from the HuggingFace cache (`~/.cache/huggingface/hub/`). Download models first with:
@@ -91,28 +96,60 @@ huggingface-cli download mlx-community/Qwen3-4B-4bit
 
 ## Supported Models
 
-Currently supports **Qwen3** architecture (including quantized 4-bit variants from [mlx-community](https://huggingface.co/mlx-community)):
+Architecture is auto-detected from `config.json`'s `"architectures"` field. No manual configuration needed.
+
+### Qwen3
+
+`Qwen3ForCausalLM` architecture — includes quantized 4-bit variants from [mlx-community](https://huggingface.co/mlx-community):
 
 - `mlx-community/Qwen3-4B-4bit`
 - `mlx-community/Qwen3-1.7B-4bit`
 
-Llama support coming soon (already implemented in upstream mlx-lm).
+### Llama
+
+`LlamaForCausalLM` architecture — Llama 3.x instruct models and quantized variants:
+
+- `mlx-community/Llama-3.2-3B-4bit`
+- Any local or HuggingFace model with `"LlamaForCausalLM"` in `config.json`
+
+## Streaming
+
+The `serve` command implements true per-token SSE streaming. Each decoded token is sent to the client immediately as it is produced — no buffering.
+
+Enable streaming by setting `"stream": true` in the request body, and pass `--no-buffer` to curl to see tokens arrive in real time:
+
+```bash
+curl --no-buffer http://localhost:8080/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "model": "qwen3",
+    "messages": [{"role": "user", "content": "Count to ten."}],
+    "max_tokens": 200,
+    "stream": true
+  }'
+```
+
+Response chunks follow the OpenAI SSE format (`data: {...}\n\n`), terminated by `data: [DONE]\n\n`. Any OpenAI-compatible client library works without modification.
 
 ## Architecture
 
 Built on top of [mlx-rs](https://github.com/oxiglade/mlx-rs) (Rust bindings for Apple's MLX framework) and its `mlx-lm` crate for model implementations.
 
 Key technical details:
-- **Pre-quantized model loading**: Handles the correct load order (quantize structure first, then load pre-quantized weights) with key remapping for `QuantizedLinear`'s `.inner.weight` paths
-- **QuantizedEmbedding workaround**: Direct field patching for mlx-rs v0.25.3's missing `#[param]` attributes
-- **Custom forward step**: Replaces the library's `Generate` iterator for proper KV cache handling and shape management
+
+- **Multi-model support via `ModelWrapper` enum**: `ModelWrapper::Qwen3` and `ModelWrapper::Llama` variants share a single inference path. Adding a new architecture requires only a new enum variant and a string match in `detect_architecture()`.
+- **Architecture auto-detection**: `config.json`'s `"architectures"` array is read at load time. Supported values: `Qwen3ForCausalLM`, `LlamaForCausalLM`. An unsupported value produces a clear error listing what was found.
+- **Pre-quantized model loading**: Handles the correct load order (quantize structure first, then load pre-quantized weights) with key remapping for `QuantizedLinear`'s `.inner.weight` paths.
+- **QuantizedEmbedding workaround**: Direct field patching for mlx-rs v0.25.3's missing `#[param]` attributes.
+- **Custom forward step**: Replaces the library's `Generate` iterator for proper KV cache handling and shape management.
+- **Thread isolation for SSE streaming**: `mlx_rs::Array` is `!Send`. The inference loop runs on a dedicated OS thread for its entire lifetime; Axum handlers communicate via `std::sync::mpsc` (requests) and `tokio::sync::mpsc` (per-token stream events).
 
 ## Commands
 
 | Command | Description |
 |---------|-------------|
 | `chat` | Interactive multi-turn conversation |
-| `serve` | OpenAI-compatible HTTP API (streaming SSE) |
+| `serve` | OpenAI-compatible HTTP API with true per-token SSE streaming |
 | `generate` | Single prompt text generation |
 | `bench` | Performance benchmark (TTFT, TPOT, TPS) |
 
@@ -125,6 +162,7 @@ Key technical details:
 | Single binary | Yes | Yes | Yes | No |
 | Rust memory safety | Yes | No (Go) | No (C++) | No |
 | Pre-quantized 4-bit | Yes | Yes | Yes (GGUF) | Yes |
+| Model support | Qwen3 + Llama | Many | Many (GGUF) | Many |
 
 ## License
 
