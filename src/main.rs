@@ -17,6 +17,22 @@ use mlx_rs::quantization::{MaybeQuantized, Quantizable};
 use mlx_rs::transforms::eval;
 use mlx_rs::Array;
 
+// ── HTTP server imports ────────────────────────────────────────────────────────
+use axum::{
+    Json,
+    extract::State,
+    http::StatusCode,
+    response::{IntoResponse, Response},
+    routing::post,
+    Router,
+};
+use serde::{Deserialize, Serialize};
+use std::sync::{Arc, Mutex};
+use tower_http::cors::{Any, CorsLayer};
+use uuid::Uuid;
+
+// ── CLI definition ─────────────────────────────────────────────────────────────
+
 #[derive(Parser)]
 #[command(name = "mlx-engine")]
 #[command(about = "Native Apple Silicon LLM inference. Single binary, zero Python.")]
@@ -74,7 +90,23 @@ enum Commands {
         #[arg(short, long, default_value = "128")]
         num_tokens: usize,
     },
+    /// Start an OpenAI-compatible HTTP API server
+    Serve {
+        /// Path to model directory (HuggingFace cache or local)
+        #[arg(short, long)]
+        model: String,
+
+        /// Port to listen on
+        #[arg(short, long, default_value = "8080")]
+        port: u16,
+
+        /// Host address to bind
+        #[arg(long, default_value = "127.0.0.1")]
+        host: String,
+    },
 }
+
+// ── Model path resolution ──────────────────────────────────────────────────────
 
 fn resolve_model_path(model: &str) -> Result<PathBuf> {
     let path = PathBuf::from(model);
@@ -109,6 +141,8 @@ fn resolve_model_path(model: &str) -> Result<PathBuf> {
         model
     )
 }
+
+// ── Weight loading helpers ─────────────────────────────────────────────────────
 
 /// Collect all safetensors weights from a model directory into a single flat map.
 fn collect_safetensors_weights(path: &PathBuf) -> Result<HashMap<String, Array>> {
@@ -323,6 +357,8 @@ fn load_model_and_tokenizer(
     Ok((model, tokenizer, path))
 }
 
+// ── Inference core ─────────────────────────────────────────────────────────────
+
 /// Single-step forward pass returning shape `(batch, vocab_size)` logits for the last token.
 ///
 /// The library's `Generate` iterator has a decode-mode shape bug: `argmax_axis` on
@@ -372,7 +408,6 @@ fn generate_tokens(
     let mut tokens: Vec<Array> = Vec::new();
     let mut decoded = String::new();
     let gen_start = Instant::now();
-    let mut ttft: Option<f64> = None;
     let mut token_count = 0usize;
 
     // --- Prefill ---
@@ -384,7 +419,7 @@ fn generate_tokens(
     // y shape: (batch,) after argmax with keep_dims=false
 
     eval(&[y.clone()]).map_err(|e| anyhow::anyhow!("{:?}", e))?;
-    ttft = Some(gen_start.elapsed().as_secs_f64());
+    let ttft = Some(gen_start.elapsed().as_secs_f64());
 
     let first_id: u32 = y.item();
     tokens.push(y.clone());
@@ -487,6 +522,8 @@ fn print_perf_stats(
     eprintln!("───────────────────────────────────────");
 }
 
+// ── Subcommand runners ─────────────────────────────────────────────────────────
+
 fn run_chat(model_path: &str, temp: f32, max_tokens: usize) -> Result<()> {
     let (mut model, tokenizer, _path) = load_model_and_tokenizer(model_path)?;
 
@@ -547,13 +584,12 @@ fn run_bench(model_path: &str, prompt: &str, num_tokens: usize) -> Result<()> {
 
     let mut token_count = 0usize;
     let gen_start = Instant::now();
-    let mut ttft: Option<f64> = None;
 
     // Prefill
     let logits = forward_step(&mut model, &prompt_tokens, &mut cache)?;
     let mut y = sample(&logits, 0.0).map_err(|e| anyhow::anyhow!("{:?}", e))?;
     eval(&[y.clone()]).map_err(|e| anyhow::anyhow!("{:?}", e))?;
-    ttft = Some(gen_start.elapsed().as_secs_f64());
+    let ttft = Some(gen_start.elapsed().as_secs_f64());
     token_count += 1;
 
     let mut batch: Vec<Array> = vec![y.clone()];
@@ -608,6 +644,465 @@ fn run_bench(model_path: &str, prompt: &str, num_tokens: usize) -> Result<()> {
     Ok(())
 }
 
+// ── HTTP server ────────────────────────────────────────────────────────────────
+//
+// mlx-rs Array / Model are !Send (they rely on thread-local MLX stream state).
+// We cannot pass them across thread boundaries.
+//
+// Architecture:
+//   - One dedicated OS thread owns Model + Tokenizer for its entire lifetime.
+//   - Axum handlers communicate with that thread via a std::sync::mpsc channel.
+//   - Each request packages its parameters into an InferRequest and attaches a
+//     one-shot reply channel; the inference thread sends back InferResponse.
+//   - The Axum handler blocks its spawn_blocking worker while waiting for the reply.
+//   - A Mutex<Sender<InferRequest>> in shared state serialises concurrent requests
+//     (one at a time, MVP).
+
+/// A single inference job sent from an HTTP handler to the model thread.
+struct InferRequest {
+    prompt: String,
+    temp: f32,
+    max_tokens: usize,
+    reply: std::sync::mpsc::SyncSender<InferResponse>,
+}
+
+/// Result of a single inference job.
+struct InferResponse {
+    text: Result<GeneratedText>,
+}
+
+struct GeneratedText {
+    content: String,
+    prompt_tokens: usize,
+    completion_tokens: usize,
+}
+
+/// Axum shared state: a mutex-protected sender to the inference thread.
+#[derive(Clone)]
+struct AppState {
+    tx: Arc<Mutex<std::sync::mpsc::SyncSender<InferRequest>>>,
+    model_name: Arc<String>,
+}
+
+// ── OpenAI-compatible request/response types ───────────────────────────────────
+
+#[derive(Debug, Deserialize)]
+struct ChatMessage {
+    role: String,
+    content: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ChatCompletionRequest {
+    #[allow(dead_code)]
+    model: Option<String>,
+    messages: Vec<ChatMessage>,
+    #[serde(default = "default_temperature")]
+    temperature: f32,
+    #[serde(default = "default_max_tokens")]
+    max_tokens: usize,
+    #[serde(default)]
+    stream: bool,
+}
+
+fn default_temperature() -> f32 { 0.7 }
+fn default_max_tokens() -> usize { 256 }
+
+#[derive(Debug, Serialize)]
+struct ChatCompletionResponse {
+    id: String,
+    object: &'static str,
+    created: u64,
+    model: String,
+    choices: Vec<ChatChoice>,
+    usage: UsageInfo,
+}
+
+#[derive(Debug, Serialize)]
+struct ChatChoice {
+    index: u32,
+    message: AssistantMessage,
+    finish_reason: &'static str,
+}
+
+#[derive(Debug, Serialize)]
+struct AssistantMessage {
+    role: &'static str,
+    content: String,
+}
+
+#[derive(Debug, Serialize)]
+struct UsageInfo {
+    prompt_tokens: usize,
+    completion_tokens: usize,
+    total_tokens: usize,
+}
+
+// SSE streaming types
+#[derive(Debug, Serialize)]
+struct ChatCompletionChunk {
+    id: String,
+    object: &'static str,
+    created: u64,
+    model: String,
+    choices: Vec<ChunkChoice>,
+}
+
+#[derive(Debug, Serialize)]
+struct ChunkChoice {
+    index: u32,
+    delta: ChunkDelta,
+    finish_reason: Option<&'static str>,
+}
+
+#[derive(Debug, Serialize)]
+struct ChunkDelta {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    role: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    content: Option<String>,
+}
+
+// ── Chat template ──────────────────────────────────────────────────────────────
+
+/// Format a list of chat messages into Qwen3's instruct prompt format.
+///
+/// ```text
+/// <|im_start|>system
+/// You are a helpful assistant.<|im_end|>
+/// <|im_start|>user
+/// Hello<|im_end|>
+/// <|im_start|>assistant
+/// ```
+fn format_qwen3_prompt(messages: &[ChatMessage]) -> String {
+    let mut prompt = String::new();
+    for msg in messages {
+        prompt.push_str(&format!(
+            "<|im_start|>{}\n{}<|im_end|>\n",
+            msg.role, msg.content
+        ));
+    }
+    prompt.push_str("<|im_start|>assistant\n");
+    prompt
+}
+
+// ── Axum error type ────────────────────────────────────────────────────────────
+
+struct ApiError(anyhow::Error);
+
+impl IntoResponse for ApiError {
+    fn into_response(self) -> Response {
+        let body = serde_json::json!({
+            "error": {
+                "message": self.0.to_string(),
+                "type": "internal_server_error",
+            }
+        });
+        (StatusCode::INTERNAL_SERVER_ERROR, Json(body)).into_response()
+    }
+}
+
+impl<E: Into<anyhow::Error>> From<E> for ApiError {
+    fn from(e: E) -> Self {
+        ApiError(e.into())
+    }
+}
+
+// ── Handler ────────────────────────────────────────────────────────────────────
+
+async fn chat_completions(
+    State(state): State<AppState>,
+    Json(req): Json<ChatCompletionRequest>,
+) -> Result<Response, ApiError> {
+    let prompt = format_qwen3_prompt(&req.messages);
+    let temp = req.temperature;
+    let max_tokens = req.max_tokens;
+    let model_name = (*state.model_name).clone();
+    let request_id = format!("chatcmpl-{}", Uuid::new_v4().simple());
+    let created = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+
+    // Clone the sender before moving into spawn_blocking.
+    let tx = Arc::clone(&state.tx);
+
+    // Run the blocking wait on a dedicated thread so we don't block the async runtime.
+    let gen = tokio::task::spawn_blocking(move || {
+        // One-shot synchronous channel for this request's reply.
+        let (reply_tx, reply_rx) = std::sync::mpsc::sync_channel::<InferResponse>(1);
+
+        let infer_req = InferRequest {
+            prompt,
+            temp,
+            max_tokens,
+            reply: reply_tx,
+        };
+
+        // Acquire the mutex only long enough to enqueue the request.
+        {
+            let sender = tx.lock().map_err(|_| anyhow::anyhow!("inference thread is gone"))?;
+            sender
+                .send(infer_req)
+                .map_err(|_| anyhow::anyhow!("inference thread channel closed"))?;
+        }
+
+        // Wait for the inference result (blocks this spawn_blocking thread).
+        reply_rx
+            .recv()
+            .map_err(|_| anyhow::anyhow!("inference thread dropped reply channel"))
+    })
+    .await
+    .map_err(|e| anyhow::anyhow!("spawn_blocking join error: {e}"))??;
+
+    let gt = gen.text?;
+
+    if req.stream {
+        // --- SSE streaming response ---
+        // We already have the full text; simulate streaming by sending it as a
+        // single content chunk followed by [DONE].  A future version can wire
+        // the inference loop to produce per-token SSE frames.
+        use axum::body::Body;
+        use axum::http::header;
+
+        let id = request_id.clone();
+        let chunk = ChatCompletionChunk {
+            id: id.clone(),
+            object: "chat.completion.chunk",
+            created,
+            model: model_name.clone(),
+            choices: vec![ChunkChoice {
+                index: 0,
+                delta: ChunkDelta {
+                    role: Some("assistant"),
+                    content: Some(gt.content.clone()),
+                },
+                finish_reason: None,
+            }],
+        };
+        let done_chunk = ChatCompletionChunk {
+            id,
+            object: "chat.completion.chunk",
+            created,
+            model: model_name,
+            choices: vec![ChunkChoice {
+                index: 0,
+                delta: ChunkDelta { role: None, content: None },
+                finish_reason: Some("stop"),
+            }],
+        };
+
+        let sse_body = format!(
+            "data: {}\n\ndata: {}\n\ndata: [DONE]\n\n",
+            serde_json::to_string(&chunk)?,
+            serde_json::to_string(&done_chunk)?
+        );
+
+        let response = axum::response::Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, "text/event-stream")
+            .header(header::CACHE_CONTROL, "no-cache")
+            .header("X-Accel-Buffering", "no")
+            .body(Body::from(sse_body))
+            .map_err(|e| anyhow::anyhow!("failed to build SSE response: {e}"))?;
+
+        return Ok(response);
+    }
+
+    // --- Non-streaming JSON response ---
+    let response = ChatCompletionResponse {
+        id: request_id,
+        object: "chat.completion",
+        created,
+        model: model_name,
+        choices: vec![ChatChoice {
+            index: 0,
+            message: AssistantMessage {
+                role: "assistant",
+                content: gt.content,
+            },
+            finish_reason: "stop",
+        }],
+        usage: UsageInfo {
+            prompt_tokens: gt.prompt_tokens,
+            completion_tokens: gt.completion_tokens,
+            total_tokens: gt.prompt_tokens + gt.completion_tokens,
+        },
+    };
+
+    Ok(Json(response).into_response())
+}
+
+// ── Inference thread loop ──────────────────────────────────────────────────────
+
+/// Run the model inference loop on the calling thread.
+///
+/// This function never returns under normal operation — it blocks processing
+/// requests until the channel sender side is dropped (server shutdown).
+fn inference_loop(
+    mut model: Model,
+    tokenizer: tokenizers::Tokenizer,
+    rx: std::sync::mpsc::Receiver<InferRequest>,
+) {
+    eprintln!("[serve] inference thread ready");
+
+    for req in rx {
+        let InferRequest { prompt, temp, max_tokens, reply } = req;
+
+        // Count prompt tokens for usage reporting.
+        let prompt_token_count = tokenizer
+            .encode(prompt.as_str(), true)
+            .map(|e| e.get_ids().len())
+            .unwrap_or(0);
+
+        let result = generate_tokens_server(&mut model, &tokenizer, &prompt, temp, max_tokens);
+
+        let response = match result {
+            Ok((text, completion_tokens)) => InferResponse {
+                text: Ok(GeneratedText {
+                    content: text,
+                    prompt_tokens: prompt_token_count,
+                    completion_tokens,
+                }),
+            },
+            Err(e) => InferResponse { text: Err(e) },
+        };
+
+        // Best-effort send; if the HTTP handler timed out, we ignore the error.
+        let _ = reply.send(response);
+    }
+
+    eprintln!("[serve] inference channel closed, thread exiting");
+}
+
+/// Like `generate_tokens` but returns `(text, completion_token_count)` and never
+/// writes to stdout — suitable for server-side use where output is JSON.
+fn generate_tokens_server(
+    model: &mut Model,
+    tokenizer: &tokenizers::Tokenizer,
+    prompt: &str,
+    temp: f32,
+    max_tokens: usize,
+) -> Result<(String, usize)> {
+    let encoding = tokenizer
+        .encode(prompt, true)
+        .map_err(|e| anyhow::anyhow!("{}", e))?;
+
+    let num_layers = model.args.num_hidden_layers as usize;
+    let mut cache: Vec<Option<ConcatKeyValueCache>> =
+        (0..num_layers).map(|_| Some(ConcatKeyValueCache::new())).collect();
+
+    let mut tokens: Vec<Array> = Vec::new();
+    let mut decoded = String::new();
+    let mut token_count = 0usize;
+
+    // Prefill
+    let prompt_tokens = Array::from(encoding.get_ids()).index(NewAxis);
+    let logits = forward_step(model, &prompt_tokens, &mut cache)?;
+    let mut y = sample(&logits, temp).map_err(|e| anyhow::anyhow!("{:?}", e))?;
+    eval(&[y.clone()]).map_err(|e| anyhow::anyhow!("{:?}", e))?;
+
+    let first_id: u32 = y.item();
+    tokens.push(y.clone());
+    token_count += 1;
+
+    if first_id == 151645 || first_id == 151643 {
+        let slice: Vec<u32> = tokens.drain(..).map(|t| t.item::<u32>()).collect();
+        let chunk = tokenizer.decode(&slice, true).map_err(|e| anyhow::anyhow!("{}", e))?;
+        decoded.push_str(&chunk);
+        return Ok((decoded, token_count));
+    }
+
+    // Decode loop
+    loop {
+        if token_count >= max_tokens {
+            break;
+        }
+
+        let inputs = y.index((.., NewAxis));
+        let logits = forward_step(model, &inputs, &mut cache)?;
+        y = sample(&logits, temp).map_err(|e| anyhow::anyhow!("{:?}", e))?;
+        tokens.push(y.clone());
+        token_count += 1;
+
+        if tokens.len() % 20 == 0 {
+            eval(&tokens).map_err(|e| anyhow::anyhow!("{:?}", e))?;
+            let slice: Vec<u32> = tokens.drain(..).map(|t| t.item::<u32>()).collect();
+            let chunk = tokenizer
+                .decode(&slice, true)
+                .map_err(|e| anyhow::anyhow!("{}", e))?;
+            decoded.push_str(&chunk);
+        }
+
+        let token_id: u32 = y.item();
+        if token_id == 151645 || token_id == 151643 {
+            break;
+        }
+    }
+
+    if !tokens.is_empty() {
+        eval(&tokens).map_err(|e| anyhow::anyhow!("{:?}", e))?;
+        let slice: Vec<u32> = tokens.drain(..).map(|t| t.item::<u32>()).collect();
+        let chunk = tokenizer
+            .decode(&slice, true)
+            .map_err(|e| anyhow::anyhow!("{}", e))?;
+        decoded.push_str(&chunk);
+    }
+
+    Ok((decoded, token_count))
+}
+
+// ── serve subcommand entrypoint ────────────────────────────────────────────────
+
+#[tokio::main]
+async fn run_serve(model_path: &str, host: &str, port: u16) -> Result<()> {
+    let (model, tokenizer, _path) = load_model_and_tokenizer(model_path)?;
+
+    // Bounded channel so slow clients apply back-pressure.
+    let (tx, rx) = std::sync::mpsc::sync_channel::<InferRequest>(4);
+
+    // Spin up the dedicated inference thread.  It owns `model` and `tokenizer`
+    // for its entire lifetime — they never cross thread boundaries.
+    std::thread::Builder::new()
+        .name("mlx-inference".into())
+        .spawn(move || inference_loop(model, tokenizer, rx))
+        .context("failed to spawn inference thread")?;
+
+    let state = AppState {
+        tx: Arc::new(Mutex::new(tx)),
+        model_name: Arc::new(model_path.to_string()),
+    };
+
+    let cors = CorsLayer::new()
+        .allow_origin(Any)
+        .allow_methods(Any)
+        .allow_headers(Any);
+
+    let app = Router::new()
+        .route("/v1/chat/completions", post(chat_completions))
+        .with_state(state)
+        .layer(cors);
+
+    let addr = format!("{host}:{port}");
+    let listener = tokio::net::TcpListener::bind(&addr)
+        .await
+        .with_context(|| format!("failed to bind to {addr}"))?;
+
+    eprintln!(
+        "[serve] mlx-engine v{} listening on http://{}",
+        env!("CARGO_PKG_VERSION"),
+        listener.local_addr()?
+    );
+    eprintln!("[serve] POST /v1/chat/completions");
+    eprintln!("[serve] Press Ctrl+C to stop");
+
+    axum::serve(listener, app).await.context("server error")?;
+
+    Ok(())
+}
+
+// ── main ───────────────────────────────────────────────────────────────────────
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
 
@@ -628,5 +1123,197 @@ fn main() -> Result<()> {
             prompt,
             num_tokens,
         } => run_bench(&model, &prompt, num_tokens),
+        Commands::Serve { model, host, port } => run_serve(&model, &host, port),
+    }
+}
+
+// ── Tests ──────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── format_qwen3_prompt ──────────────────────────────────────────────────
+
+    #[test]
+    fn test_format_single_user_message() {
+        let messages = vec![ChatMessage {
+            role: "user".into(),
+            content: "Hello".into(),
+        }];
+        let prompt = format_qwen3_prompt(&messages);
+        assert_eq!(
+            prompt,
+            "<|im_start|>user\nHello<|im_end|>\n<|im_start|>assistant\n"
+        );
+    }
+
+    #[test]
+    fn test_format_system_plus_user() {
+        let messages = vec![
+            ChatMessage {
+                role: "system".into(),
+                content: "You are a helpful assistant.".into(),
+            },
+            ChatMessage {
+                role: "user".into(),
+                content: "What is 2+2?".into(),
+            },
+        ];
+        let prompt = format_qwen3_prompt(&messages);
+        assert!(prompt.starts_with("<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n"));
+        assert!(prompt.contains("<|im_start|>user\nWhat is 2+2?<|im_end|>\n"));
+        assert!(prompt.ends_with("<|im_start|>assistant\n"));
+    }
+
+    #[test]
+    fn test_format_multi_turn() {
+        let messages = vec![
+            ChatMessage { role: "user".into(), content: "Hi".into() },
+            ChatMessage { role: "assistant".into(), content: "Hello!".into() },
+            ChatMessage { role: "user".into(), content: "How are you?".into() },
+        ];
+        let prompt = format_qwen3_prompt(&messages);
+        // All three turns should appear in order.
+        let user_pos = prompt.find("<|im_start|>user\nHi").unwrap();
+        let assistant_pos = prompt.find("<|im_start|>assistant\nHello!").unwrap();
+        let user2_pos = prompt.find("<|im_start|>user\nHow are you?").unwrap();
+        assert!(user_pos < assistant_pos);
+        assert!(assistant_pos < user2_pos);
+        // Must end with the open assistant turn.
+        assert!(prompt.ends_with("<|im_start|>assistant\n"));
+    }
+
+    #[test]
+    fn test_format_empty_messages() {
+        let messages: Vec<ChatMessage> = vec![];
+        let prompt = format_qwen3_prompt(&messages);
+        assert_eq!(prompt, "<|im_start|>assistant\n");
+    }
+
+    #[test]
+    fn test_format_special_characters() {
+        let messages = vec![ChatMessage {
+            role: "user".into(),
+            content: "What's 5 * 7?\n(show work)".into(),
+        }];
+        let prompt = format_qwen3_prompt(&messages);
+        assert!(prompt.contains("What's 5 * 7?\n(show work)"));
+    }
+
+    // ── ChatCompletionRequest deserialization ────────────────────────────────
+
+    #[test]
+    fn test_request_defaults() {
+        let json = r#"{"messages":[{"role":"user","content":"hi"}]}"#;
+        let req: ChatCompletionRequest = serde_json::from_str(json).unwrap();
+        assert!((req.temperature - 0.7).abs() < f32::EPSILON);
+        assert_eq!(req.max_tokens, 256);
+        assert!(!req.stream);
+        assert!(req.model.is_none());
+    }
+
+    #[test]
+    fn test_request_explicit_fields() {
+        let json = r#"{
+            "model": "qwen3-4b",
+            "messages": [{"role": "user", "content": "Hello"}],
+            "temperature": 0.3,
+            "max_tokens": 128,
+            "stream": true
+        }"#;
+        let req: ChatCompletionRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.model.as_deref(), Some("qwen3-4b"));
+        assert!((req.temperature - 0.3).abs() < f32::EPSILON);
+        assert_eq!(req.max_tokens, 128);
+        assert!(req.stream);
+        assert_eq!(req.messages[0].role, "user");
+        assert_eq!(req.messages[0].content, "Hello");
+    }
+
+    // ── ChatCompletionResponse serialization ─────────────────────────────────
+
+    #[test]
+    fn test_response_serialization() {
+        let response = ChatCompletionResponse {
+            id: "chatcmpl-abc".into(),
+            object: "chat.completion",
+            created: 1_700_000_000,
+            model: "qwen3-4b".into(),
+            choices: vec![ChatChoice {
+                index: 0,
+                message: AssistantMessage {
+                    role: "assistant",
+                    content: "4".into(),
+                },
+                finish_reason: "stop",
+            }],
+            usage: UsageInfo {
+                prompt_tokens: 10,
+                completion_tokens: 1,
+                total_tokens: 11,
+            },
+        };
+        let json = serde_json::to_string(&response).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["object"], "chat.completion");
+        assert_eq!(v["choices"][0]["message"]["role"], "assistant");
+        assert_eq!(v["choices"][0]["message"]["content"], "4");
+        assert_eq!(v["usage"]["total_tokens"], 11);
+    }
+
+    // ── resolve_model_path ───────────────────────────────────────────────────
+
+    #[test]
+    fn test_resolve_existing_path() {
+        // The project root always exists; resolving it as a model path should
+        // succeed and return that path verbatim.
+        let manifest_dir = env!("CARGO_MANIFEST_DIR");
+        let result = resolve_model_path(manifest_dir);
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), PathBuf::from(manifest_dir));
+    }
+
+    #[test]
+    fn test_resolve_nonexistent_path() {
+        let result = resolve_model_path("/absolutely/does/not/exist/model-xyz");
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(msg.contains("Model not found"));
+    }
+
+    // ── UsageInfo arithmetic ─────────────────────────────────────────────────
+
+    #[test]
+    fn test_usage_total() {
+        let usage = UsageInfo {
+            prompt_tokens: 42,
+            completion_tokens: 13,
+            total_tokens: 42 + 13,
+        };
+        assert_eq!(usage.total_tokens, 55);
+    }
+
+    // ── ChunkDelta skip_serializing_if ───────────────────────────────────────
+
+    #[test]
+    fn test_chunk_delta_omits_none_fields() {
+        let delta = ChunkDelta { role: None, content: None };
+        let json = serde_json::to_string(&delta).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert!(v.get("role").is_none(), "None role should be omitted");
+        assert!(v.get("content").is_none(), "None content should be omitted");
+    }
+
+    #[test]
+    fn test_chunk_delta_includes_some_fields() {
+        let delta = ChunkDelta {
+            role: Some("assistant"),
+            content: Some("hello".into()),
+        };
+        let json = serde_json::to_string(&delta).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["role"], "assistant");
+        assert_eq!(v["content"], "hello");
     }
 }

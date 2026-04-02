@@ -22,6 +22,12 @@ anyhow = "1"
 indicatif = "0.18"
 dirs = "6"
 
+# HTTP server dependencies (used by `serve` subcommand)
+axum = { version = "0.7", features = ["macros"] }
+tokio = { version = "1", features = ["full"] }
+tower-http = { version = "0.5", features = ["cors"] }
+uuid = { version = "1", features = ["v4"] }
+
 [profile.release]
 lto = true
 opt-level = 3
