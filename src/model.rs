@@ -89,11 +89,19 @@ impl ModelWrapper {
 
         let logits = match self {
             ModelWrapper::Qwen3(m) => {
-                let input = qwen3::ModelInput { inputs, mask: None, cache };
+                let input = qwen3::ModelInput {
+                    inputs,
+                    mask: None,
+                    cache,
+                };
                 m.forward(input).map_err(|e| anyhow::anyhow!("{:?}", e))?
             }
             ModelWrapper::Llama(m) => {
-                let input = llama::ModelInput { inputs, mask: None, cache };
+                let input = llama::ModelInput {
+                    inputs,
+                    mask: None,
+                    cache,
+                };
                 m.forward(input).map_err(|e| anyhow::anyhow!("{:?}", e))?
             }
         };
@@ -122,12 +130,12 @@ impl ModelWrapper {
     /// Load safetensors weights from a file (non-quantized path).
     pub fn load_safetensors(&mut self, path: &Path) -> Result<()> {
         match self {
-            ModelWrapper::Qwen3(m) => {
-                m.load_safetensors(path).map_err(|e| anyhow::anyhow!("{:?}", e))
-            }
-            ModelWrapper::Llama(m) => {
-                m.load_safetensors(path).map_err(|e| anyhow::anyhow!("{:?}", e))
-            }
+            ModelWrapper::Qwen3(m) => m
+                .load_safetensors(path)
+                .map_err(|e| anyhow::anyhow!("{:?}", e)),
+            ModelWrapper::Llama(m) => m
+                .load_safetensors(path)
+                .map_err(|e| anyhow::anyhow!("{:?}", e)),
         }
     }
 }
@@ -184,7 +192,11 @@ pub fn collect_safetensors_weights(path: &Path) -> Result<HashMap<String, Array>
         let weight_files: std::collections::HashSet<String> = parsed
             .get("weight_map")
             .and_then(|v| v.as_object())
-            .map(|m| m.values().filter_map(|v| v.as_str().map(String::from)).collect())
+            .map(|m| {
+                m.values()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect()
+            })
             .unwrap_or_default();
 
         for weight_file in weight_files {
@@ -238,15 +250,12 @@ pub fn load_prequantized_weights_qwen3(
     model: &mut qwen3::Model,
     mut safetensors_weights: HashMap<String, Array>,
 ) -> Result<()> {
-    load_prequantized_weights_inner(
-        model,
-        "model.embed_tokens",
-        &mut safetensors_weights,
-        |m| match &mut m.model.embed_tokens {
+    load_prequantized_weights_inner(model, "model.embed_tokens", &mut safetensors_weights, |m| {
+        match &mut m.model.embed_tokens {
             MaybeQuantized::Quantized(qe) => Some(qe),
             MaybeQuantized::Original(_) => None,
-        },
-    )
+        }
+    })
 }
 
 /// Load pre-quantized safetensors weights into an already-quantized Llama model.
@@ -254,15 +263,12 @@ pub fn load_prequantized_weights_llama(
     model: &mut llama::Model,
     mut safetensors_weights: HashMap<String, Array>,
 ) -> Result<()> {
-    load_prequantized_weights_inner(
-        model,
-        "model.embed_tokens",
-        &mut safetensors_weights,
-        |m| match &mut m.model.embed_tokens {
+    load_prequantized_weights_inner(model, "model.embed_tokens", &mut safetensors_weights, |m| {
+        match &mut m.model.embed_tokens {
             MaybeQuantized::Quantized(qe) => Some(qe),
             MaybeQuantized::Original(_) => None,
-        },
-    )
+        }
+    })
 }
 
 /// Generic inner implementation shared by both model families.
@@ -384,7 +390,10 @@ pub fn load_model_and_tokenizer(
         let gs = q.get("group_size").and_then(|v| v.as_i64()).unwrap_or(64) as i32;
         let b = q.get("bits").and_then(|v| v.as_i64()).unwrap_or(4) as i32;
 
-        eprintln!("Quantizing model structure ({}-bit, group_size={})...", b, gs);
+        eprintln!(
+            "Quantizing model structure ({}-bit, group_size={})...",
+            b, gs
+        );
         model_wrapper = model_wrapper
             .try_into_quantized(gs, b)
             .context("Failed to create quantized model structure")?;
@@ -407,7 +416,11 @@ pub fn load_model_and_tokenizer(
             let files: std::collections::HashSet<String> = parsed
                 .get("weight_map")
                 .and_then(|v| v.as_object())
-                .map(|m| m.values().filter_map(|v| v.as_str().map(String::from)).collect())
+                .map(|m| {
+                    m.values()
+                        .filter_map(|v| v.as_str().map(String::from))
+                        .collect()
+                })
                 .unwrap_or_default();
             files.into_iter().map(|f| path.join(f)).collect()
         } else {
@@ -444,8 +457,10 @@ fn collect_eos_tokens(config: &serde_json::Value, family: ModelFamily) -> Vec<u3
             return vec![id as u32];
         }
         if let Some(arr) = eos.as_array() {
-            let ids: Vec<u32> =
-                arr.iter().filter_map(|v| v.as_u64().map(|n| n as u32)).collect();
+            let ids: Vec<u32> = arr
+                .iter()
+                .filter_map(|v| v.as_u64().map(|n| n as u32))
+                .collect();
             if !ids.is_empty() {
                 return ids;
             }
@@ -546,8 +561,7 @@ mod tests {
     #[test]
     fn test_detect_first_matching_architecture() {
         // If multiple architectures are listed, first recognized one wins.
-        let config =
-            serde_json::json!({ "architectures": ["UnknownArch", "LlamaForCausalLM"] });
+        let config = serde_json::json!({ "architectures": ["UnknownArch", "LlamaForCausalLM"] });
         let family = detect_architecture(&config).unwrap();
         assert_eq!(family, ModelFamily::Llama);
     }

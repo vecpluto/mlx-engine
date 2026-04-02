@@ -99,7 +99,10 @@ enum Commands {
 fn run_chat(model_path: &str, temp: f32, max_tokens: usize) -> Result<()> {
     let (mut model, tokenizer, eos_tokens, _path) = load_model_and_tokenizer(model_path)?;
 
-    eprintln!("\nmlx-engine v{} — Type 'quit' to exit\n", env!("CARGO_PKG_VERSION"));
+    eprintln!(
+        "\nmlx-engine v{} — Type 'quit' to exit\n",
+        env!("CARGO_PKG_VERSION")
+    );
 
     loop {
         print!("You: ");
@@ -121,7 +124,14 @@ fn run_chat(model_path: &str, temp: f32, max_tokens: usize) -> Result<()> {
         print!("Assistant: ");
         io::stdout().flush()?;
 
-        generate_streaming(&mut model, &tokenizer, &prompt, temp, max_tokens, &eos_tokens)?;
+        generate_streaming(
+            &mut model,
+            &tokenizer,
+            &prompt,
+            temp,
+            max_tokens,
+            &eos_tokens,
+        )?;
     }
 
     Ok(())
@@ -129,7 +139,14 @@ fn run_chat(model_path: &str, temp: f32, max_tokens: usize) -> Result<()> {
 
 fn run_generate(model_path: &str, prompt: &str, temp: f32, max_tokens: usize) -> Result<()> {
     let (mut model, tokenizer, eos_tokens, _path) = load_model_and_tokenizer(model_path)?;
-    generate_streaming(&mut model, &tokenizer, prompt, temp, max_tokens, &eos_tokens)?;
+    generate_streaming(
+        &mut model,
+        &tokenizer,
+        prompt,
+        temp,
+        max_tokens,
+        &eos_tokens,
+    )?;
     Ok(())
 }
 
@@ -144,11 +161,22 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::Chat { model, temp, max_tokens } => run_chat(&model, temp, max_tokens),
-        Commands::Generate { model, prompt, temp, max_tokens } => {
-            run_generate(&model, &prompt, temp, max_tokens)
-        }
-        Commands::Bench { model, prompt, num_tokens } => run_bench_cmd(&model, &prompt, num_tokens),
+        Commands::Chat {
+            model,
+            temp,
+            max_tokens,
+        } => run_chat(&model, temp, max_tokens),
+        Commands::Generate {
+            model,
+            prompt,
+            temp,
+            max_tokens,
+        } => run_generate(&model, &prompt, temp, max_tokens),
+        Commands::Bench {
+            model,
+            prompt,
+            num_tokens,
+        } => run_bench_cmd(&model, &prompt, num_tokens),
         Commands::Serve { model, host, port } => {
             let (mdl, tokenizer, eos_tokens, _path) = load_model_and_tokenizer(&model)?;
             // Determine model family for prompt formatting in the server.

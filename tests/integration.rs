@@ -125,10 +125,18 @@ fn test_resolve_nonexistent_model() {
     // `resolve_model_path` is `pub` in model.rs.  Integration tests access it
     // indirectly via the binary: asking for a model that does not exist must
     // produce a non-zero exit and a helpful error message.
-    let (ok, output) = run(&["generate", "--model", "/nonexistent/model/xyz", "--prompt", "hi"]);
+    let (ok, output) = run(&[
+        "generate",
+        "--model",
+        "/nonexistent/model/xyz",
+        "--prompt",
+        "hi",
+    ]);
     assert!(!ok, "generate with missing model must fail");
     assert!(
-        output.contains("Model not found") || output.contains("not found") || output.contains("No such file"),
+        output.contains("Model not found")
+            || output.contains("not found")
+            || output.contains("No such file"),
         "error should mention that the model was not found; got: {output}"
     );
 }
@@ -212,7 +220,10 @@ fn test_detect_unknown_architecture() {
 fn test_detect_architecture_missing_field() {
     let config = json!({ "model_type": "qwen" });
     let err = detect_architecture(&config).unwrap_err();
-    assert!(err.contains("architectures"), "error should mention the missing field; got: {err}");
+    assert!(
+        err.contains("architectures"),
+        "error should mention the missing field; got: {err}"
+    );
 }
 
 #[test]
@@ -357,7 +368,10 @@ fn test_chat_response_serialization_roundtrip() {
     assert_eq!(deserialized.model, "mlx-community/Qwen3-4B-4bit");
     assert_eq!(deserialized.choices.len(), 1);
     assert_eq!(deserialized.choices[0].message.role, "assistant");
-    assert_eq!(deserialized.choices[0].message.content, "Rust is a systems language.");
+    assert_eq!(
+        deserialized.choices[0].message.content,
+        "Rust is a systems language."
+    );
     assert_eq!(deserialized.choices[0].finish_reason, "stop");
     assert_eq!(deserialized.usage.prompt_tokens, 15);
     assert_eq!(deserialized.usage.completion_tokens, 6);
@@ -371,7 +385,10 @@ fn test_usage_total_tokens_is_sum() {
         completion_tokens: 42,
         total_tokens: 142,
     };
-    assert_eq!(usage.total_tokens, usage.prompt_tokens + usage.completion_tokens);
+    assert_eq!(
+        usage.total_tokens,
+        usage.prompt_tokens + usage.completion_tokens
+    );
 }
 
 #[test]
@@ -382,11 +399,19 @@ fn test_response_required_fields_present_in_json() {
         created: 0,
         model: "test-model".into(),
         choices: vec![],
-        usage: UsageInfoRt { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
+        usage: UsageInfoRt {
+            prompt_tokens: 0,
+            completion_tokens: 0,
+            total_tokens: 0,
+        },
     };
-    let v: serde_json::Value = serde_json::from_str(&serde_json::to_string(&response).unwrap()).unwrap();
+    let v: serde_json::Value =
+        serde_json::from_str(&serde_json::to_string(&response).unwrap()).unwrap();
     for field in &["id", "object", "created", "model", "choices", "usage"] {
-        assert!(v.get(field).is_some(), "field '{field}' missing from serialized response");
+        assert!(
+            v.get(field).is_some(),
+            "field '{field}' missing from serialized response"
+        );
     }
 }
 
@@ -409,7 +434,13 @@ fn test_full_generate_pipeline() {
         "--temp",
         "0.0",
     ]);
-    assert!(ok, "generate should succeed with a valid model; stderr: {output}");
+    assert!(
+        ok,
+        "generate should succeed with a valid model; stderr: {output}"
+    );
     // The generate subcommand streams tokens to stdout.
-    assert!(!output.trim().is_empty(), "generated output should be non-empty");
+    assert!(
+        !output.trim().is_empty(),
+        "generated output should be non-empty"
+    );
 }

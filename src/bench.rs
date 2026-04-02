@@ -31,8 +31,9 @@ pub fn run_bench(
     let num_prompt_tokens = encoding.get_ids().len();
 
     let num_layers = model.num_hidden_layers();
-    let mut cache: Vec<Option<ConcatKeyValueCache>> =
-        (0..num_layers).map(|_| Some(ConcatKeyValueCache::new())).collect();
+    let mut cache: Vec<Option<ConcatKeyValueCache>> = (0..num_layers)
+        .map(|_| Some(ConcatKeyValueCache::new()))
+        .collect();
 
     let mut token_count = 0usize;
     let gen_start = Instant::now();
@@ -86,7 +87,10 @@ pub fn run_bench(
     println!("╔══════════════════════════════════════════╗");
     println!("║        MLX-Engine Benchmark Results      ║");
     println!("╠══════════════════════════════════════════╣");
-    println!("║  Prompt tokens:     {:>6}               ║", num_prompt_tokens);
+    println!(
+        "║  Prompt tokens:     {:>6}               ║",
+        num_prompt_tokens
+    );
     println!("║  Generated tokens:  {:>6}               ║", token_count);
     println!("║                                          ║");
     println!("║  TTFT (prefill):    {:>8.3}s             ║", ttft_val);

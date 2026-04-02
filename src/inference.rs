@@ -43,7 +43,7 @@ pub fn forward_step(
 
 // ── Unified generation ─────────────────────────────────────────────────────────
 
-/// Generate tokens from `prompt`, calling `on_chunk` for each decoded text chunk.
+/// Generate tokens from `prompt`, calling `on_chunk` for each decoded token.
 ///
 /// This single function covers both interactive (streaming to stdout) and server
 /// (silent, collect into string) use cases via the `on_chunk` callback.
@@ -55,13 +55,14 @@ pub fn forward_step(
 /// # use mlx_engine::inference::{generate, GenerateOutput};
 /// let out = generate(&mut model, &tokenizer, "Hello", 0.7, 256, &[151645, 151643], |chunk| {
 ///     print!("{chunk}");
+///     true
 /// })?;
 /// println!("\n{:.1} tok/s", out.completion_tokens as f64 / out.total_time);
 /// ```
 ///
 /// Silent (server mode):
 /// ```no_run
-/// let out = generate(&mut model, &tokenizer, &prompt, temp, max_tokens, &eos_tokens, |_| {})?;
+/// let out = generate(&mut model, &tokenizer, &prompt, temp, max_tokens, &eos_tokens, |_| true)?;
 /// ```
 pub fn generate(
     model: &mut ModelWrapper,
@@ -70,7 +71,7 @@ pub fn generate(
     temp: f32,
     max_tokens: usize,
     eos_tokens: &[u32],
-    mut on_chunk: impl FnMut(&str),
+    mut on_chunk: impl FnMut(&str) -> bool,
 ) -> Result<GenerateOutput> {
     use mlx_rs::ops::indexing::{IndexOp, NewAxis};
 
@@ -79,11 +80,22 @@ pub fn generate(
         .map_err(|e| anyhow::anyhow!("{}", e))?;
     let num_prompt_tokens = encoding.get_ids().len();
 
-    let num_layers = model.num_hidden_layers();
-    let mut cache: Vec<Option<ConcatKeyValueCache>> =
-        (0..num_layers).map(|_| Some(ConcatKeyValueCache::new())).collect();
+    if max_tokens == 0 {
+        return Ok(GenerateOutput {
+            text: String::new(),
+            prompt_tokens: num_prompt_tokens,
+            completion_tokens: 0,
+            ttft: None,
+            total_time: 0.0,
+        });
+    }
 
-    let mut pending: Vec<Array> = Vec::new();
+    let num_layers = model.num_hidden_layers();
+    let mut cache: Vec<Option<ConcatKeyValueCache>> = (0..num_layers)
+        .map(|_| Some(ConcatKeyValueCache::new()))
+        .collect();
+
+    let mut pending_eval: Vec<Array> = Vec::new();
     let mut decoded = String::new();
     let gen_start = Instant::now();
     let mut token_count = 0usize;
@@ -93,18 +105,26 @@ pub fn generate(
     let logits = forward_step(model, &prompt_tokens, &mut cache)?;
 
     let mut y = sample(&logits, temp).map_err(|e| anyhow::anyhow!("{:?}", e))?;
-    eval(&[y.clone()]).map_err(|e| anyhow::anyhow!("{:?}", e))?;
-    let ttft = Some(gen_start.elapsed().as_secs_f64());
-
     let first_id: u32 = y.item();
-    pending.push(y.clone());
+    let ttft = Some(gen_start.elapsed().as_secs_f64());
+    pending_eval.push(y.clone());
     token_count += 1;
+    let chunk = decode_token(tokenizer, first_id)?;
+    if !on_chunk(&chunk) {
+        decoded.push_str(&chunk);
+        return Ok(GenerateOutput {
+            text: decoded,
+            prompt_tokens: num_prompt_tokens,
+            completion_tokens: token_count,
+            ttft,
+            total_time: gen_start.elapsed().as_secs_f64(),
+        });
+    }
+    decoded.push_str(&chunk);
 
     // Check EOS immediately after prefill.
     if eos_tokens.contains(&first_id) {
-        let chunk = flush_tokens(tokenizer, &mut pending)?;
-        on_chunk(&chunk);
-        decoded.push_str(&chunk);
+        eval_pending(&mut pending_eval)?;
         return Ok(GenerateOutput {
             text: decoded,
             prompt_tokens: num_prompt_tokens,
@@ -124,27 +144,34 @@ pub fn generate(
         let logits = forward_step(model, &inputs, &mut cache)?;
         y = sample(&logits, temp).map_err(|e| anyhow::anyhow!("{:?}", e))?;
 
-        pending.push(y.clone());
+        let token_id: u32 = y.item();
+        pending_eval.push(y.clone());
         token_count += 1;
-
-        // Periodically eval and stream decoded chunks to the caller.
-        if pending.len().is_multiple_of(20) {
-            let chunk = flush_tokens(tokenizer, &mut pending)?;
-            on_chunk(&chunk);
+        let chunk = decode_token(tokenizer, token_id)?;
+        if !on_chunk(&chunk) {
             decoded.push_str(&chunk);
+            return Ok(GenerateOutput {
+                text: decoded,
+                prompt_tokens: num_prompt_tokens,
+                completion_tokens: token_count,
+                ttft,
+                total_time: gen_start.elapsed().as_secs_f64(),
+            });
+        }
+        decoded.push_str(&chunk);
+
+        // Periodically force MLX lazy evaluation while still streaming each token.
+        if pending_eval.len().is_multiple_of(20) {
+            eval_pending(&mut pending_eval)?;
         }
 
-        let token_id: u32 = y.item();
         if eos_tokens.contains(&token_id) {
             break;
         }
     }
 
-    // Flush any remaining tokens.
-    if !pending.is_empty() {
-        let chunk = flush_tokens(tokenizer, &mut pending)?;
-        on_chunk(&chunk);
-        decoded.push_str(&chunk);
+    if !pending_eval.is_empty() {
+        eval_pending(&mut pending_eval)?;
     }
 
     Ok(GenerateOutput {
@@ -158,13 +185,19 @@ pub fn generate(
 
 // ── Helpers ────────────────────────────────────────────────────────────────────
 
-/// Eval and decode a batch of token arrays, draining `tokens` in place.
-fn flush_tokens(tokenizer: &Tokenizer, tokens: &mut Vec<Array>) -> Result<String> {
+/// Force evaluation of pending token arrays, draining `tokens` in place.
+fn eval_pending(tokens: &mut Vec<Array>) -> Result<()> {
     // eval requires &Array items; collect refs first.
     let refs: Vec<&Array> = tokens.iter().collect();
     eval(refs).map_err(|e| anyhow::anyhow!("{:?}", e))?;
-    let ids: Vec<u32> = tokens.drain(..).map(|t| t.item::<u32>()).collect();
-    tokenizer.decode(&ids, true).map_err(|e| anyhow::anyhow!("{}", e))
+    tokens.clear();
+    Ok(())
+}
+
+fn decode_token(tokenizer: &Tokenizer, token_id: u32) -> Result<String> {
+    tokenizer
+        .decode(&[token_id], true)
+        .map_err(|e| anyhow::anyhow!("{}", e))
 }
 
 // ── Performance reporting ──────────────────────────────────────────────────────
@@ -199,10 +232,19 @@ pub fn generate_streaming(
     max_tokens: usize,
     eos_tokens: &[u32],
 ) -> Result<GenerateOutput> {
-    let out = generate(model, tokenizer, prompt, temp, max_tokens, eos_tokens, |chunk| {
-        print!("{chunk}");
-        let _ = io::stdout().flush();
-    })?;
+    let out = generate(
+        model,
+        tokenizer,
+        prompt,
+        temp,
+        max_tokens,
+        eos_tokens,
+        |chunk| {
+            print!("{chunk}");
+            let _ = io::stdout().flush();
+            true
+        },
+    )?;
     print_perf_stats(&out);
     println!();
     Ok(out)
@@ -214,6 +256,6 @@ pub fn generate_streaming(
 mod tests {
     // Integration tests that run model inference require downloaded weights and
     // are too slow for CI.  The logic covered here is EOS token checking and
-    // the flush_tokens helper, both of which need an actual tokenizer to test
+    // per-token decoding, both of which need an actual tokenizer to test
     // meaningfully.  See the server module tests for pure-logic unit tests.
 }

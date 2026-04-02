@@ -1,4 +1,4 @@
-//! OpenAI-compatible HTTP API server with true per-token SSE streaming.
+//! OpenAI-compatible HTTP API server with per-token SSE streaming.
 //!
 //! mlx-rs `Array` / `Model` are `!Send` (they rely on thread-local MLX stream state).
 //! We cannot pass them across thread boundaries.
@@ -15,16 +15,15 @@ use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result};
 use axum::{
-    Json,
-    extract::State,
-    http::StatusCode,
+    extract::{rejection::JsonRejection, State},
+    http::{HeaderValue, StatusCode},
     response::{IntoResponse, Response},
     routing::post,
-    Router,
+    Json, Router,
 };
 use serde::{Deserialize, Serialize};
 use tokenizers::Tokenizer;
-use tower_http::cors::{Any, CorsLayer};
+use tower_http::cors::{AllowOrigin, Any, CorsLayer};
 use uuid::Uuid;
 
 use crate::inference::generate;
@@ -34,7 +33,7 @@ use crate::model::{ModelFamily, ModelWrapper};
 
 /// Events sent from the inference thread to the async handler during streaming.
 pub enum StreamEvent {
-    /// A decoded text chunk (may be multiple tokens when flushed in batches).
+    /// A decoded token text fragment.
     Token(String),
     /// Generation complete.
     Done {
@@ -107,6 +106,8 @@ fn default_max_tokens() -> usize {
     256
 }
 
+const INTERNAL_SERVER_ERROR_MESSAGE: &str = "Internal server error";
+
 #[derive(Debug, Serialize)]
 pub struct ChatCompletionResponse {
     pub id: String,
@@ -176,7 +177,10 @@ pub struct ChunkDelta {
 pub fn format_qwen3_prompt(messages: &[ChatMessage]) -> String {
     let mut prompt = String::new();
     for msg in messages {
-        prompt.push_str(&format!("<|im_start|>{}\n{}<|im_end|>\n", msg.role, msg.content));
+        prompt.push_str(&format!(
+            "<|im_start|>{}\n{}<|im_end|>\n",
+            msg.role, msg.content
+        ));
     }
     prompt.push_str("<|im_start|>assistant\n");
     prompt
@@ -214,32 +218,112 @@ pub fn format_prompt(messages: &[ChatMessage], family: ModelFamily) -> String {
 
 // ── Axum error type ────────────────────────────────────────────────────────────
 
-struct ApiError(anyhow::Error);
+struct ApiError {
+    status: StatusCode,
+    message: String,
+    error_type: &'static str,
+}
+
+impl ApiError {
+    fn bad_request(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::BAD_REQUEST,
+            message: message.into(),
+            error_type: "invalid_request_error",
+        }
+    }
+
+    fn internal(error: anyhow::Error) -> Self {
+        eprintln!("[serve] internal error: {error:#}");
+        Self {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            message: INTERNAL_SERVER_ERROR_MESSAGE.to_owned(),
+            error_type: "internal_server_error",
+        }
+    }
+}
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         let body = serde_json::json!({
             "error": {
-                "message": self.0.to_string(),
-                "type": "internal_server_error",
+                "message": self.message,
+                "type": self.error_type,
             }
         });
-        (StatusCode::INTERNAL_SERVER_ERROR, Json(body)).into_response()
+        (self.status, Json(body)).into_response()
     }
 }
 
 impl<E: Into<anyhow::Error>> From<E> for ApiError {
     fn from(e: E) -> Self {
-        ApiError(e.into())
+        ApiError::internal(e.into())
     }
+}
+
+fn validate_chat_completion_request(req: &ChatCompletionRequest) -> Result<(), ApiError> {
+    if req.messages.is_empty() {
+        return Err(ApiError::bad_request("messages must be non-empty"));
+    }
+
+    for (index, message) in req.messages.iter().enumerate() {
+        if !matches!(message.role.as_str(), "system" | "user" | "assistant") {
+            return Err(ApiError::bad_request(format!(
+                "messages[{index}].role must be one of: system, user, assistant"
+            )));
+        }
+    }
+
+    if !req.temperature.is_finite() || !(0.0..=2.0).contains(&req.temperature) {
+        return Err(ApiError::bad_request(
+            "temperature must be between 0.0 and 2.0",
+        ));
+    }
+
+    if !(1..=4096).contains(&req.max_tokens) {
+        return Err(ApiError::bad_request(
+            "max_tokens must be between 1 and 4096",
+        ));
+    }
+
+    Ok(())
+}
+
+fn is_localhost_origin(origin: &HeaderValue) -> bool {
+    let Ok(origin) = origin.to_str() else {
+        return false;
+    };
+    let Some((_, rest)) = origin.split_once("://") else {
+        return false;
+    };
+    let authority = rest.split('/').next().unwrap_or(rest);
+    if authority.is_empty() {
+        return false;
+    }
+
+    let host = if authority.starts_with('[') {
+        let Some(end) = authority.find(']') else {
+            return false;
+        };
+        &authority[..=end]
+    } else {
+        authority.split(':').next().unwrap_or(authority)
+    };
+
+    matches!(host, "localhost" | "127.0.0.1" | "[::1]")
 }
 
 // ── Handler ────────────────────────────────────────────────────────────────────
 
 async fn chat_completions(
     State(state): State<AppState>,
-    Json(req): Json<ChatCompletionRequest>,
+    payload: Result<Json<ChatCompletionRequest>, JsonRejection>,
 ) -> Result<Response, ApiError> {
+    let Json(req) = payload.map_err(|err| {
+        ApiError::bad_request(format!("invalid request body: {}", err.body_text()))
+    })?;
+    validate_chat_completion_request(&req)?;
+
     let prompt = format_prompt(&req.messages, state.model_family);
     let temp = req.temperature;
     let max_tokens = req.max_tokens;
@@ -254,13 +338,14 @@ async fn chat_completions(
     let tx = Arc::clone(&state.tx);
 
     if is_stream {
-        // True per-token SSE streaming.
-        let (stream_tx, mut stream_rx) =
-            tokio::sync::mpsc::unbounded_channel::<StreamEvent>();
+        // Per-token SSE streaming.
+        let (stream_tx, mut stream_rx) = tokio::sync::mpsc::unbounded_channel::<StreamEvent>();
 
         // Send the inference request with streaming channel.
         {
-            let sender = tx.lock().map_err(|_| anyhow::anyhow!("inference thread is gone"))?;
+            let sender = tx
+                .lock()
+                .map_err(|_| anyhow::anyhow!("inference thread is gone"))?;
             sender
                 .send(InferRequest {
                     prompt,
@@ -349,7 +434,8 @@ async fn chat_completions(
             }
         };
 
-        let body = Body::from_stream(sse_stream.map(|r: Result<Vec<u8>, std::convert::Infallible>| r));
+        let body =
+            Body::from_stream(sse_stream.map(|r: Result<Vec<u8>, std::convert::Infallible>| r));
 
         let response = axum::response::Response::builder()
             .status(StatusCode::OK)
@@ -375,7 +461,9 @@ async fn chat_completions(
         };
 
         {
-            let sender = tx.lock().map_err(|_| anyhow::anyhow!("inference thread is gone"))?;
+            let sender = tx
+                .lock()
+                .map_err(|_| anyhow::anyhow!("inference thread is gone"))?;
             sender
                 .send(infer_req)
                 .map_err(|_| anyhow::anyhow!("inference thread channel closed"))?;
@@ -397,7 +485,10 @@ async fn chat_completions(
         model: model_name,
         choices: vec![ChatChoice {
             index: 0,
-            message: AssistantMessage { role: "assistant", content: gt.content },
+            message: AssistantMessage {
+                role: "assistant",
+                content: gt.content,
+            },
             finish_reason: "stop",
         }],
         usage: UsageInfo {
@@ -424,7 +515,13 @@ fn inference_loop(
     eprintln!("[serve] inference thread ready");
 
     for req in rx {
-        let InferRequest { prompt, temp, max_tokens, stream_tx, reply } = req;
+        let InferRequest {
+            prompt,
+            temp,
+            max_tokens,
+            stream_tx,
+            reply,
+        } = req;
 
         if let Some(tx) = stream_tx {
             // Streaming mode: send tokens as they are decoded.
@@ -440,10 +537,7 @@ fn inference_loop(
                 temp,
                 max_tokens,
                 &eos_tokens,
-                |chunk| {
-                    // Ignore send errors (client may have disconnected).
-                    let _ = tx.send(StreamEvent::Token(chunk.to_owned()));
-                },
+                |chunk| tx.send(StreamEvent::Token(chunk.to_owned())).is_ok(),
             );
 
             match result {
@@ -454,7 +548,8 @@ fn inference_loop(
                     });
                 }
                 Err(e) => {
-                    let _ = tx.send(StreamEvent::Error(e.to_string()));
+                    eprintln!("[serve] streaming inference error: {e:#}");
+                    let _ = tx.send(StreamEvent::Error(INTERNAL_SERVER_ERROR_MESSAGE.to_owned()));
                 }
             }
         } else if let Some(reply_tx) = reply {
@@ -471,7 +566,7 @@ fn inference_loop(
                 temp,
                 max_tokens,
                 &eos_tokens,
-                |_| {},
+                |_| true,
             );
 
             let response = match result {
@@ -518,7 +613,9 @@ pub async fn run_serve(
     };
 
     let cors = CorsLayer::new()
-        .allow_origin(Any)
+        .allow_origin(AllowOrigin::predicate(|origin, _| {
+            is_localhost_origin(origin)
+        }))
         .allow_methods(Any)
         .allow_headers(Any);
 
@@ -555,9 +652,15 @@ mod tests {
 
     #[test]
     fn test_format_qwen3_single_user_message() {
-        let messages = vec![ChatMessage { role: "user".into(), content: "Hello".into() }];
+        let messages = vec![ChatMessage {
+            role: "user".into(),
+            content: "Hello".into(),
+        }];
         let prompt = format_qwen3_prompt(&messages);
-        assert_eq!(prompt, "<|im_start|>user\nHello<|im_end|>\n<|im_start|>assistant\n");
+        assert_eq!(
+            prompt,
+            "<|im_start|>user\nHello<|im_end|>\n<|im_start|>assistant\n"
+        );
     }
 
     #[test]
@@ -567,12 +670,13 @@ mod tests {
                 role: "system".into(),
                 content: "You are a helpful assistant.".into(),
             },
-            ChatMessage { role: "user".into(), content: "What is 2+2?".into() },
+            ChatMessage {
+                role: "user".into(),
+                content: "What is 2+2?".into(),
+            },
         ];
         let prompt = format_qwen3_prompt(&messages);
-        assert!(
-            prompt.starts_with("<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n")
-        );
+        assert!(prompt.starts_with("<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n"));
         assert!(prompt.contains("<|im_start|>user\nWhat is 2+2?<|im_end|>\n"));
         assert!(prompt.ends_with("<|im_start|>assistant\n"));
     }
@@ -580,9 +684,18 @@ mod tests {
     #[test]
     fn test_format_qwen3_multi_turn() {
         let messages = vec![
-            ChatMessage { role: "user".into(), content: "Hi".into() },
-            ChatMessage { role: "assistant".into(), content: "Hello!".into() },
-            ChatMessage { role: "user".into(), content: "How are you?".into() },
+            ChatMessage {
+                role: "user".into(),
+                content: "Hi".into(),
+            },
+            ChatMessage {
+                role: "assistant".into(),
+                content: "Hello!".into(),
+            },
+            ChatMessage {
+                role: "user".into(),
+                content: "How are you?".into(),
+            },
         ];
         let prompt = format_qwen3_prompt(&messages);
         let user_pos = prompt.find("<|im_start|>user\nHi").unwrap();
@@ -614,13 +727,14 @@ mod tests {
 
     #[test]
     fn test_format_llama3_single_user_message() {
-        let messages = vec![ChatMessage { role: "user".into(), content: "Hello".into() }];
+        let messages = vec![ChatMessage {
+            role: "user".into(),
+            content: "Hello".into(),
+        }];
         let prompt = format_llama3_prompt(&messages);
         assert!(prompt.starts_with("<|begin_of_text|>"));
         assert!(prompt.contains("<|start_header_id|>user<|end_header_id|>\n\nHello<|eot_id|>"));
-        assert!(prompt.ends_with(
-            "<|start_header_id|>assistant<|end_header_id|>\n\n"
-        ));
+        assert!(prompt.ends_with("<|start_header_id|>assistant<|end_header_id|>\n\n"));
     }
 
     #[test]
@@ -630,7 +744,10 @@ mod tests {
                 role: "system".into(),
                 content: "You are a helpful assistant.".into(),
             },
-            ChatMessage { role: "user".into(), content: "Hi".into() },
+            ChatMessage {
+                role: "user".into(),
+                content: "Hi".into(),
+            },
         ];
         let prompt = format_llama3_prompt(&messages);
         assert!(prompt.starts_with("<|begin_of_text|>"));
@@ -653,7 +770,10 @@ mod tests {
 
     #[test]
     fn test_format_prompt_dispatch() {
-        let messages = vec![ChatMessage { role: "user".into(), content: "Hi".into() }];
+        let messages = vec![ChatMessage {
+            role: "user".into(),
+            content: "Hi".into(),
+        }];
         let qwen3 = format_prompt(&messages, ModelFamily::Qwen3);
         let llama = format_prompt(&messages, ModelFamily::Llama);
         assert!(qwen3.contains("<|im_start|>"));
@@ -699,7 +819,10 @@ mod tests {
             model: "qwen3-4b".into(),
             choices: vec![ChatChoice {
                 index: 0,
-                message: AssistantMessage { role: "assistant", content: "4".into() },
+                message: AssistantMessage {
+                    role: "assistant",
+                    content: "4".into(),
+                },
                 finish_reason: "stop",
             }],
             usage: UsageInfo {
@@ -718,14 +841,20 @@ mod tests {
 
     #[test]
     fn test_usage_total() {
-        let usage =
-            UsageInfo { prompt_tokens: 42, completion_tokens: 13, total_tokens: 42 + 13 };
+        let usage = UsageInfo {
+            prompt_tokens: 42,
+            completion_tokens: 13,
+            total_tokens: 42 + 13,
+        };
         assert_eq!(usage.total_tokens, 55);
     }
 
     #[test]
     fn test_chunk_delta_omits_none_fields() {
-        let delta = ChunkDelta { role: None, content: None };
+        let delta = ChunkDelta {
+            role: None,
+            content: None,
+        };
         let json = serde_json::to_string(&delta).unwrap();
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert!(v.get("role").is_none(), "None role should be omitted");
@@ -734,10 +863,136 @@ mod tests {
 
     #[test]
     fn test_chunk_delta_includes_some_fields() {
-        let delta = ChunkDelta { role: Some("assistant"), content: Some("hello".into()) };
+        let delta = ChunkDelta {
+            role: Some("assistant"),
+            content: Some("hello".into()),
+        };
         let json = serde_json::to_string(&delta).unwrap();
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(v["role"], "assistant");
         assert_eq!(v["content"], "hello");
+    }
+
+    #[test]
+    fn test_validate_request_rejects_empty_messages() {
+        let req = ChatCompletionRequest {
+            model: None,
+            messages: vec![],
+            temperature: 0.7,
+            max_tokens: 256,
+            stream: false,
+        };
+
+        let err = validate_chat_completion_request(&req).unwrap_err();
+        assert_eq!(err.status, StatusCode::BAD_REQUEST);
+        assert_eq!(err.message, "messages must be non-empty");
+    }
+
+    #[test]
+    fn test_validate_request_rejects_invalid_role() {
+        let req = ChatCompletionRequest {
+            model: None,
+            messages: vec![ChatMessage {
+                role: "tool".into(),
+                content: "hi".into(),
+            }],
+            temperature: 0.7,
+            max_tokens: 256,
+            stream: false,
+        };
+
+        let err = validate_chat_completion_request(&req).unwrap_err();
+        assert_eq!(err.status, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            err.message,
+            "messages[0].role must be one of: system, user, assistant"
+        );
+    }
+
+    #[test]
+    fn test_validate_request_rejects_invalid_temperature() {
+        let req = ChatCompletionRequest {
+            model: None,
+            messages: vec![ChatMessage {
+                role: "user".into(),
+                content: "hi".into(),
+            }],
+            temperature: 2.5,
+            max_tokens: 256,
+            stream: false,
+        };
+
+        let err = validate_chat_completion_request(&req).unwrap_err();
+        assert_eq!(err.status, StatusCode::BAD_REQUEST);
+        assert_eq!(err.message, "temperature must be between 0.0 and 2.0");
+    }
+
+    #[test]
+    fn test_validate_request_rejects_invalid_max_tokens() {
+        let req = ChatCompletionRequest {
+            model: None,
+            messages: vec![ChatMessage {
+                role: "user".into(),
+                content: "hi".into(),
+            }],
+            temperature: 0.7,
+            max_tokens: 4097,
+            stream: false,
+        };
+
+        let err = validate_chat_completion_request(&req).unwrap_err();
+        assert_eq!(err.status, StatusCode::BAD_REQUEST);
+        assert_eq!(err.message, "max_tokens must be between 1 and 4096");
+    }
+
+    #[test]
+    fn test_validate_request_accepts_valid_request() {
+        let req = ChatCompletionRequest {
+            model: None,
+            messages: vec![
+                ChatMessage {
+                    role: "system".into(),
+                    content: "You are helpful.".into(),
+                },
+                ChatMessage {
+                    role: "user".into(),
+                    content: "hi".into(),
+                },
+                ChatMessage {
+                    role: "assistant".into(),
+                    content: "hello".into(),
+                },
+            ],
+            temperature: 1.0,
+            max_tokens: 256,
+            stream: true,
+        };
+
+        assert!(validate_chat_completion_request(&req).is_ok());
+    }
+
+    #[test]
+    fn test_is_localhost_origin_accepts_localhost_hosts() {
+        for origin in [
+            "http://localhost:3000",
+            "https://localhost",
+            "http://127.0.0.1:8080",
+            "http://[::1]:5173",
+        ] {
+            assert!(
+                is_localhost_origin(&HeaderValue::from_str(origin).unwrap()),
+                "{origin}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_is_localhost_origin_rejects_non_localhost_hosts() {
+        for origin in ["http://example.com", "https://192.168.1.10:3000", "null"] {
+            assert!(
+                !is_localhost_origin(&HeaderValue::from_str(origin).unwrap()),
+                "{origin}"
+            );
+        }
     }
 }

@@ -87,6 +87,8 @@ curl --no-buffer http://localhost:8080/v1/chat/completions \
   -d '{"model":"qwen3","messages":[{"role":"user","content":"Hello!"}],"max_tokens":100,"stream":true}'
 ```
 
+The `chat` command currently sends only the current user turn to the model; it does not preserve conversation history between turns.
+
 Models are automatically resolved from the HuggingFace cache (`~/.cache/huggingface/hub/`). Download models first with:
 
 ```bash
@@ -114,7 +116,7 @@ Architecture is auto-detected from `config.json`'s `"architectures"` field. No m
 
 ## Streaming
 
-The `serve` command implements true per-token SSE streaming. Each decoded token is sent to the client immediately as it is produced — no buffering.
+The `serve` command implements per-token SSE streaming. Each decoded token is sent to the client as it is produced, while MLX evaluation is still forced periodically during generation.
 
 Enable streaming by setting `"stream": true` in the request body, and pass `--no-buffer` to curl to see tokens arrive in real time:
 
@@ -148,8 +150,8 @@ Key technical details:
 
 | Command | Description |
 |---------|-------------|
-| `chat` | Interactive multi-turn conversation |
-| `serve` | OpenAI-compatible HTTP API with true per-token SSE streaming |
+| `chat` | Interactive prompt loop without conversation history between turns |
+| `serve` | OpenAI-compatible HTTP API with per-token SSE streaming |
 | `generate` | Single prompt text generation |
 | `bench` | Performance benchmark (TTFT, TPOT, TPS) |
 
