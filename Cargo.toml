@@ -1,0 +1,28 @@
+[package]
+name = "mlx-engine"
+version = "0.1.0"
+edition = "2021"
+description = "Native Apple Silicon LLM inference engine powered by MLX. Single binary, zero Python dependency."
+license = "MIT"
+repository = "https://github.com/vecpluto/mlx-engine"
+keywords = ["llm", "mlx", "apple-silicon", "inference", "rust"]
+categories = ["command-line-utilities", "science"]
+
+[dependencies]
+mlx-rs = { git = "https://github.com/oxiglade/mlx-rs.git", tag = "v0.25.3" }
+mlx-lm = { git = "https://github.com/oxiglade/mlx-rs.git", tag = "v0.25.3" }
+mlx-lm-utils = { git = "https://github.com/oxiglade/mlx-rs.git", tag = "v0.25.3" }
+mlx-macros = { git = "https://github.com/oxiglade/mlx-rs.git", tag = "v0.25.3" }
+
+clap = { version = "4", features = ["derive"] }
+tokenizers = { version = "0.22", features = ["http"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+indicatif = "0.18"
+dirs = "6"
+
+[profile.release]
+lto = true
+opt-level = 3
+strip = true
